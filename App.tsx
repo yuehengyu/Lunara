@@ -2,7 +2,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { Plus, Bell, Calendar as CalendarIcon, List, Database, Loader2, Info, X, Radio, Send, RotateCw, RefreshCw } from 'lucide-react';
 import { AppEvent } from './types';
-import { fetchEvents, createEvent, deleteEvent, updateEvent, isSupabaseConfigured, saveSubscription } from './services/storage';
+import { fetchEvents, createEvent, deleteEvent, updateEvent, isSupabaseConfigured, saveSubscription, cleanupPastEvents } from './services/storage';
 import { checkNotifications, getNextOccurrence, shouldUpdateRecurringEvent } from './services/timeService';
 import { EventCard } from './components/EventCard';
 import { AddEventModal } from './components/AddEventModal';
@@ -65,6 +65,14 @@ const App: React.FC = () => {
       const data = await fetchEvents(deviceId);
       setEvents(data);
       setIsLoading(false);
+
+      // Auto-Cleanup Trigger
+      if (data.length > 0) {
+        const deletedIds = await cleanupPastEvents(data);
+        if (deletedIds && deletedIds.length > 0) {
+          setEvents(prev => prev.filter(e => !deletedIds.includes(e.id)));
+        }
+      }
     };
 
     if (isSupabaseConfigured) {
@@ -87,9 +95,6 @@ const App: React.FC = () => {
           const sub = await registration.pushManager.getSubscription();
           if (sub && sub.options.applicationServerKey) {
             const currentKey = arrayBufferToBase64(sub.options.applicationServerKey);
-            // Check if key starts with the same characters (simple check)
-            // Note: browser might return standard base64 vs url-safe, so we check loosely or just re-sub if backend fails.
-            // But let's try a direct comparison if possible.
             if (currentKey !== VAPID_PUBLIC_KEY) {
               console.log("Key mismatch detected. Current:", currentKey, "Expected:", VAPID_PUBLIC_KEY);
               // Silent upgrade
@@ -182,10 +187,9 @@ const App: React.FC = () => {
 
       if (!res.ok) {
         // AUTO-HEALING
-        // If 403 (BadJwtToken) or 404 (Deleted), we must reset the client.
         if (res.status === 403 || res.status === 404 || (data.error && data.error.includes("expired"))) {
           console.warn("Detected invalid subscription (403/404). Auto-healing...");
-          await enablePushNotifications(true); // Force Unsubscribe -> Subscribe
+          await enablePushNotifications(true);
           alert("Your push configuration was outdated and has been reset. Please click Test again!");
           setIsTestingPush(false);
           return;
@@ -230,11 +234,13 @@ const App: React.FC = () => {
       }
 
       if (data.success) {
-        if (data.eventsFound > 0) {
-          alert(`Success! Found ${data.eventsFound} upcoming events and sent to ${data.devicesNotified} devices.`);
-        } else {
-          alert("Check complete, but no events found in the next 24 hours.");
-        }
+        let msg = `Check complete.`;
+        if (data.eventsFound > 0) msg += ` Scanned ${data.eventsFound} events.`;
+        if (data.eventsDeleted > 0) msg += ` Cleaned up ${data.eventsDeleted} past events.`;
+        if (data.matchedAlerts > 0) msg += ` Found ${data.matchedAlerts} relevant alerts.`;
+        else msg += ` No alerts for tomorrow.`;
+
+        alert(msg);
       } else {
         alert("Check completed: " + (data.message || data.error));
       }

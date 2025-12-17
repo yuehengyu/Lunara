@@ -1,6 +1,7 @@
 
 import { createClient } from '@supabase/supabase-js';
 import { AppEvent } from '../types';
+import { DateTime } from 'luxon';
 
 const supabaseUrl = process.env.VITE_SUPABASE_URL;
 const supabaseKey = process.env.VITE_SUPABASE_ANON_KEY;
@@ -51,7 +52,7 @@ export const fetchEvents = async (deviceId?: string): Promise<AppEvent[]> => {
       .select('*')
       .order('created_at', { ascending: false });
 
-  // If we have a deviceId, simpler apps might filter by it, 
+  // If we have a deviceId, simpler apps might filter by it,
   // but for now we fetch all (shared mode) or you can uncomment below to isolate:
   // if (deviceId) query = query.eq('device_id', deviceId);
 
@@ -63,6 +64,32 @@ export const fetchEvents = async (deviceId?: string): Promise<AppEvent[]> => {
   }
 
   return data ? data.map(mapFromDb) : [];
+};
+
+// NEW: Clean up expired one-time events from the frontend on load
+export const cleanupPastEvents = async (events: AppEvent[]) => {
+  if (!supabase) return;
+
+  const now = DateTime.now();
+  const toDelete: string[] = [];
+
+  events.forEach(e => {
+    // If it has NO recurrence rule
+    if (!e.recurrenceRule || e.recurrenceRule.type === 'none') {
+      const eventTime = DateTime.fromISO(e.startAt, { zone: e.timezone });
+      // If event time + 12 hours buffer is still in the past
+      if (eventTime.plus({ hours: 12 }) < now) {
+        toDelete.push(e.id);
+      }
+    }
+  });
+
+  if (toDelete.length > 0) {
+    console.log(`Auto-deleting ${toDelete.length} past events...`);
+    await supabase.from('events').delete().in('id', toDelete);
+    return toDelete; // Return IDs so UI can update state locally
+  }
+  return [];
 };
 
 export const createEvent = async (event: AppEvent) => {

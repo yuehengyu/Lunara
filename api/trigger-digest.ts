@@ -2,6 +2,7 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { createClient } from '@supabase/supabase-js';
 import webpush from 'web-push';
+import { DateTime } from 'luxon';
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
     if (req.method !== 'POST' && req.method !== 'GET') {
@@ -28,47 +29,93 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     try {
-        const now = new Date();
-        const tomorrow = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+        // 1. Target Day (Tomorrow Toronto)
+        const nowToronto = DateTime.now().setZone('America/Toronto');
+        const targetDayStart = nowToronto.plus({ days: 1 }).startOf('day');
+        const targetDayEnd = nowToronto.plus({ days: 1 }).endOf('day');
 
+        console.log(`Manual Trigger: Checking ALL events for alerts on ${targetDayStart.toFormat('yyyy-MM-dd')}`);
+
+        // 2. Fetch ALL events (No date filter)
         const { data: events, error: eventError } = await supabase
             .from('events')
-            .select('*')
-            .gte('next_alert_at', now.toISOString())
-            .lte('next_alert_at', tomorrow.toISOString());
+            .select('*');
 
         if (eventError) throw eventError;
 
         if (!events || events.length === 0) {
-            return res.status(200).json({ success: true, eventsFound: 0, message: 'No upcoming events.' });
+            return res.status(200).json({ success: true, eventsFound: 0, message: 'Database empty.' });
         }
 
         const notificationsSent = [];
-        const deviceEvents: Record<string, any[]> = {};
+        const deviceAlerts: Record<string, string[]> = {};
+        const eventsToDelete: string[] = [];
+        let matchedAlertCount = 0;
 
         for (const event of events) {
+            const eventTime = DateTime.fromISO(event.next_alert_at).setZone('America/Toronto');
+            const isOneTime = !event.recurrence_rule || event.recurrence_rule.type === 'none';
+
+            // CLEANUP: If one-time and past (allow 12h buffer just in case)
+            if (isOneTime && eventTime < nowToronto.minus({ hours: 12 })) {
+                eventsToDelete.push(event.id);
+                continue;
+            }
+
             if (!event.device_id) continue;
-            if (!deviceEvents[event.device_id]) deviceEvents[event.device_id] = [];
-            deviceEvents[event.device_id].push(event);
+
+            const reminders = event.reminders || [0];
+
+            for (const minutesBefore of reminders) {
+                const alertTime = eventTime.minus({ minutes: minutesBefore });
+
+                // Match Target Day
+                if (alertTime >= targetDayStart && alertTime <= targetDayEnd) {
+
+                    matchedAlertCount++;
+                    if (!deviceAlerts[event.device_id]) deviceAlerts[event.device_id] = [];
+
+                    let label = "";
+
+                    if (minutesBefore === 0) {
+                        label = `• ${alertTime.toFormat('HH:mm')} - ${event.title}`;
+                    } else if (minutesBefore === 1440) {
+                        label = `• ${event.title} is tomorrow!`;
+                    } else if (minutesBefore > 1440) {
+                        const days = Math.round(minutesBefore / 1440);
+                        label = `• Heads up: ${event.title} in ${days} days`;
+                    } else {
+                        label = `• Reminder: ${event.title} (${eventTime.toFormat('HH:mm')})`;
+                    }
+                    if (!deviceAlerts[event.device_id].includes(label)) {
+                        deviceAlerts[event.device_id].push(label);
+                    }
+                }
+            }
         }
 
-        for (const [deviceId, userEvents] of Object.entries(deviceEvents)) {
-            if (!userEvents || userEvents.length === 0) continue;
+        // Execute Cleanup
+        if (eventsToDelete.length > 0) {
+            await supabase.from('events').delete().in('id', eventsToDelete);
+        }
 
-            const { data: subs, error: subError } = await supabase
-                .from('subscriptions')
-                .select('*')
-                .eq('device_id', deviceId);
+        if (matchedAlertCount === 0) {
+            return res.status(200).json({
+                success: true,
+                eventsFound: events.length,
+                eventsDeleted: eventsToDelete.length,
+                message: 'Events checked. No alerts fall on target day.'
+            });
+        }
 
-            if (subError || !subs || subs.length === 0) continue;
+        for (const [deviceId, alerts] of Object.entries(deviceAlerts)) {
+            if (!alerts || alerts.length === 0) continue;
 
-            const eventCount = userEvents.length;
-            const title = `📅 Upcoming: ${eventCount} Event${eventCount > 1 ? 's' : ''}`;
-            const bodyLines = userEvents
-                .slice(0, 3)
-                .map((e: any) => `• ${e.title} at ${new Date(e.next_alert_at).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}`);
-            if (userEvents.length > 3) bodyLines.push(`...and ${userEvents.length - 3} more.`);
-            const body = bodyLines.join('\n');
+            const { data: subs } = await supabase.from('subscriptions').select('*').eq('device_id', deviceId);
+            if (!subs || subs.length === 0) continue;
+
+            const title = `📅 Daily Digest: ${alerts.length} Alert${alerts.length > 1 ? 's' : ''}`;
+            const body = alerts.slice(0, 4).join('\n') + (alerts.length > 4 ? `\n...and ${alerts.length - 4} more` : '');
 
             for (const subRecord of subs) {
                 try {
@@ -77,7 +124,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
                     notificationsSent.push(deviceId);
                 } catch (err: any) {
                     console.error(`Failed to push to device ${deviceId}`, err);
-                    // Delete subscription if invalid (4xx) to allow client to heal later
                     if (err.statusCode === 410 || err.statusCode === 404 || err.statusCode === 403) {
                         await supabase.from('subscriptions').delete().eq('id', subRecord.id);
                     }
@@ -88,6 +134,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         res.status(200).json({
             success: true,
             eventsFound: events.length,
+            eventsDeleted: eventsToDelete.length,
+            matchedAlerts: matchedAlertCount,
             devicesNotified: notificationsSent.length
         });
     } catch (error: any) {
