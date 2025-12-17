@@ -1,6 +1,6 @@
 
 import React, { useState, useEffect, useCallback } from 'react';
-import { Plus, Bell, Calendar as CalendarIcon, List, Database, Loader2, Info, X, Radio, Send, RotateCw } from 'lucide-react';
+import { Plus, Bell, Calendar as CalendarIcon, List, Database, Loader2, Info, X, Radio, Send, RotateCw, RefreshCw } from 'lucide-react';
 import { AppEvent } from './types';
 import { fetchEvents, createEvent, deleteEvent, updateEvent, isSupabaseConfigured, saveSubscription } from './services/storage';
 import { checkNotifications, getNextOccurrence, shouldUpdateRecurringEvent } from './services/timeService';
@@ -19,6 +19,9 @@ function urlBase64ToUint8Array(base64String: string) {
   }
   return outputArray;
 }
+
+// HARDCODED PUBLIC KEY (Must match the Private Key in Backend)
+const VAPID_PUBLIC_KEY = 'BDS748jbOSm0hDpwy9IHva9edOidWJHtD-Z9WT2KmKW0bsu0YcHD1dKYjJIg_WkIn1ZtvlLnTaNz_b-zWGZoH0E';
 
 const App: React.FC = () => {
   const [events, setEvents] = useState<AppEvent[]>([]);
@@ -48,7 +51,7 @@ const App: React.FC = () => {
   useEffect(() => {
     const load = async () => {
       setIsLoading(true);
-      const data = await fetchEvents(deviceId); // Pass deviceId if you want to filter
+      const data = await fetchEvents(deviceId);
       setEvents(data);
       setIsLoading(false);
     };
@@ -65,33 +68,41 @@ const App: React.FC = () => {
   }, [deviceId]);
 
   // Request Notification & Subscribe to Push
-  const enablePushNotifications = async () => {
+  const enablePushNotifications = async (forceReset = false) => {
     if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
       alert("Push notifications are not supported on this browser.");
       return;
     }
 
     try {
-      const permission = await Notification.requestPermission();
-      setPermission(permission);
+      const perm = await Notification.requestPermission();
+      setPermission(perm);
 
-      if (permission === 'granted') {
+      if (perm === 'granted') {
         const registration = await navigator.serviceWorker.ready;
-        const vapidKey = process.env.VITE_VAPID_PUBLIC_KEY;
+        let subscription = await registration.pushManager.getSubscription();
 
-        if (!vapidKey) {
-          console.warn("Missing VITE_VAPID_PUBLIC_KEY env var");
-          return;
+        // If forcing reset (e.g. keys changed), unsubscribe first
+        if (forceReset && subscription) {
+          await subscription.unsubscribe();
+          subscription = null;
         }
 
-        const subscription = await registration.pushManager.subscribe({
-          userVisibleOnly: true,
-          applicationServerKey: urlBase64ToUint8Array(vapidKey)
-        });
+        if (!subscription) {
+          subscription = await registration.pushManager.subscribe({
+            userVisibleOnly: true,
+            applicationServerKey: urlBase64ToUint8Array(VAPID_PUBLIC_KEY)
+          });
+        }
 
         // Save to Supabase
         await saveSubscription(deviceId, subscription);
-        alert("Push notifications enabled! You will now receive alerts even if the app is closed.");
+
+        if (forceReset) {
+          alert("Push notifications re-configured successfully!");
+        } else {
+          // alert("Push notifications enabled!"); // Reduced noise
+        }
       }
     } catch (error) {
       console.error("Push subscription failed", error);
@@ -106,17 +117,30 @@ const App: React.FC = () => {
     }
     setIsTestingPush(true);
     try {
+      // FORCE SYNC: Before testing, ensure server has the latest subscription
+      // This fixes the "No subscription found" error if the DB was cleared or sync failed.
+      if ('serviceWorker' in navigator) {
+        const registration = await navigator.serviceWorker.ready;
+        const subscription = await registration.pushManager.getSubscription();
+        if (subscription) {
+          console.log("Force syncing subscription before test...");
+          await saveSubscription(deviceId, subscription);
+        } else {
+          // If permission granted but no subscription object, try to re-subscribe
+          await enablePushNotifications(false);
+        }
+      }
+
       const res = await fetch('/api/test-push', {
         method: 'POST',
         body: JSON.stringify({ deviceId }),
         headers: { 'Content-Type': 'application/json' }
       });
 
-      // Check for non-JSON response (e.g., 404 HTML from Vite or 500 HTML from Vercel)
       const contentType = res.headers.get("content-type");
       if (!contentType || !contentType.includes("application/json")) {
         const text = await res.text();
-        throw new Error(`Server returned non-JSON response (${res.status}). Are you running locally? API endpoints only work on Vercel deployment. Response snippet: ${text.slice(0, 100)}`);
+        throw new Error(`Server returned non-JSON response (${res.status}). Response: ${text.slice(0, 100)}`);
       }
 
       const data = await res.json();
@@ -149,11 +173,10 @@ const App: React.FC = () => {
         method: 'POST',
       });
 
-      // Check for non-JSON response
       const contentType = res.headers.get("content-type");
       if (!contentType || !contentType.includes("application/json")) {
         const text = await res.text();
-        throw new Error(`Server returned non-JSON response (${res.status}). If running 'npm run dev', APIs won't work. Deploy to Vercel to test. Response: ${text.slice(0, 100)}...`);
+        throw new Error(`Server Error. Response: ${text.slice(0, 100)}...`);
       }
 
       const data = await res.json();
@@ -179,25 +202,23 @@ const App: React.FC = () => {
     }
   };
 
-  // Local Polling for foreground alerts
+  // Local Polling
   useEffect(() => {
     const intervalId = window.setInterval(async () => {
       // 1. Check Foreground Notifications
       checkNotifications(events, (event, text) => {
         const key = `${event.id}-${new Date().getMinutes()}`;
         if (!notifiedLog.has(key)) {
-          // In-App Popup
           setTriggerEvent(event);
           setNotifiedLog(prev => new Set(prev).add(key));
         }
       });
 
-      // 2. Auto-update recurring events (Logic moved to save, but keeping this for safety)
+      // 2. Auto-update recurring events
       let needsRefresh = false;
       const updatedEvents = await Promise.all(events.map(async (event) => {
         const newStartAt = shouldUpdateRecurringEvent(event);
         if (newStartAt) {
-          // Recalculate next alert for backend too
           const tempEvent = { ...event, startAt: newStartAt };
           const nextOcc = getNextOccurrence(tempEvent);
 
@@ -224,13 +245,12 @@ const App: React.FC = () => {
   }, [events, permission, notifiedLog]);
 
   const handleSaveEvent = async (event: AppEvent) => {
-    // CRITICAL: Calculate the Next Alert Timestamp BEFORE saving to DB
     const nextOcc = getNextOccurrence(event);
 
     const eventWithMeta: AppEvent = {
       ...event,
-      deviceId, // Link to this device
-      nextAlertAt: nextOcc.isoString // Pre-calculate for backend
+      deviceId,
+      nextAlertAt: nextOcc.isoString
     };
 
     if (editingEvent) {
@@ -280,11 +300,13 @@ const App: React.FC = () => {
               <span className="bg-indigo-600 text-white p-1.5 rounded-lg text-lg sm:text-xl shadow-sm">LR</span>
               LunaRemind
             </h1>
-            <p className="text-xs sm:text-sm text-slate-500 mt-1">Cloud Push Enabled</p>
+            <p className="text-xs sm:text-sm text-slate-500 mt-1">
+              {isSupabaseConfigured ? 'Cloud Sync Active' : 'Offline Mode'}
+            </p>
           </div>
 
           <div className="flex items-center gap-2 sm:gap-3">
-            {/* Test Button for immediate feedback */}
+            {/* Test & Actions */}
             {permission === 'granted' && (
                 <>
                   <button
@@ -301,21 +323,30 @@ const App: React.FC = () => {
                       onClick={handleTriggerDigest}
                       disabled={isCheckingDigest}
                       className="flex items-center gap-1.5 text-xs sm:text-sm text-indigo-700 bg-indigo-50 px-3 py-2 rounded-full hover:bg-indigo-100 border border-indigo-200 transition-colors"
-                      title="Manually trigger the backend check for upcoming events"
+                      title="Check for upcoming events now"
                   >
                     <RotateCw className={`w-3.5 h-3.5 ${isCheckingDigest ? 'animate-spin' : ''}`} />
-                    <span className="hidden sm:inline">{isCheckingDigest ? 'Checking...' : 'Check Upcoming'}</span>
+                    <span className="hidden sm:inline">{isCheckingDigest ? 'Check' : 'Check'}</span>
                   </button>
                 </>
             )}
 
-            {permission !== 'granted' && (
+            {permission !== 'granted' ? (
                 <button
-                    onClick={enablePushNotifications}
+                    onClick={() => enablePushNotifications(false)}
                     className="flex items-center gap-2 text-xs sm:text-sm text-indigo-600 bg-indigo-50 px-3 py-2 rounded-full hover:bg-indigo-100 transition-colors border border-indigo-200"
                 >
                   <Radio className="w-4 h-4" />
                   <span className="hidden sm:inline">Enable Push</span>
+                </button>
+            ) : (
+                // Hidden Reset Button (Only shows if permission granted)
+                <button
+                    onClick={() => enablePushNotifications(true)}
+                    className="flex items-center justify-center p-2 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-full transition-colors"
+                    title="Reset Push Connection"
+                >
+                  <RefreshCw className="w-4 h-4" />
                 </button>
             )}
 
@@ -346,7 +377,7 @@ const App: React.FC = () => {
                 <div className="pr-4">
                   <p className="text-sm font-semibold">Real Push Notifications</p>
                   <p className="text-xs sm:text-sm mt-1 text-blue-700/80">
-                    Click "Enable Push" to receive notifications even when the app is closed. This uses Vercel Cron Jobs to check your events.
+                    Click "Enable Push" to receive notifications even when the app is closed. If you have issues, try clicking the small refresh icon top right.
                   </p>
                 </div>
                 <button
