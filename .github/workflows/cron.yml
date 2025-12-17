@@ -18,4 +18,4 @@ jobs:
         # 4. Value: https://your-project.vercel.app (No trailing slash)
         run: |
           echo "Triggering Cron..."
-          curl -v -X POST "${{ secrets.VERCEL_PROJECT_URL || 'https://lunara-psi.vercel.app' }}/api/cron"
+          curl -v -X POST "${{ secrets.VERCEL_PROJECT_URL || 'https://lunara-psi.vercel.app' }}/api/cron?type=check"
