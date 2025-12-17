@@ -5,7 +5,7 @@ import webpush from 'web-push';
 
 // Config
 const SUPABASE_URL = process.env.SUPABASE_URL!;
-const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!; // Must use Service Role to read all subs
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
 const VAPID_PUBLIC_KEY = process.env.VITE_VAPID_PUBLIC_KEY!;
 const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY!;
 const VAPID_EMAIL = process.env.VITE_VAPID_EMAIL || 'mailto:example@example.com';
@@ -19,76 +19,86 @@ webpush.setVapidDetails(
 );
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
-    // Security: Only Vercel Cron can call this (automatically handled by Vercel usually, but good to check headers if needed)
-
     try {
         const now = new Date();
+        const tomorrow = new Date(now.getTime() + 24 * 60 * 60 * 1000);
 
-        // 1. Fetch Events that are due (next_alert_at <= now)
-        // We only fetch events that haven't been processed yet.
-        // Optimization: In a real app, you'd mark them as "processing" or update next_alert_at immediately.
-        // Here, we assume the frontend pre-calculated `next_alert_at`.
-        // We fetch events due in the last minute or future (if slight drift).
-
+        // Daily Digest Mode: Fetch events scheduled for the next 24 hours
+        // This runs once a day (e.g., 7 AM / 8 AM Toronto Time)
         const { data: events, error: eventError } = await supabase
             .from('events')
             .select('*')
-            .lte('next_alert_at', now.toISOString())
-            .gt('next_alert_at', new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString()); // Don't fetch extremely old missed ones
+            .gte('next_alert_at', now.toISOString())
+            .lte('next_alert_at', tomorrow.toISOString());
 
         if (eventError) throw eventError;
 
         if (!events || events.length === 0) {
-            return res.status(200).json({ message: 'No events due.' });
+            return res.status(200).json({ message: 'No upcoming events for today.' });
         }
 
         const notificationsSent = [];
 
-        // 2. For each due event, find the subscription for that device
+        // Group events by device_id to send a single summary per device
+        const deviceEvents: Record<string, typeof events> = {};
         for (const event of events) {
             if (!event.device_id) continue;
+            if (!deviceEvents[event.device_id]) {
+                deviceEvents[event.device_id] = [];
+            }
+            deviceEvents[event.device_id].push(event);
+        }
 
+        // Process each device
+        for (const [deviceId, userEvents] of Object.entries(deviceEvents)) {
+            // Fetch subscription for this device
             const { data: subs, error: subError } = await supabase
                 .from('subscriptions')
                 .select('*')
-                .eq('device_id', event.device_id);
+                .eq('device_id', deviceId);
 
-            if (subError || !subs) continue;
+            if (subError || !subs || subs.length === 0) continue;
 
+            // Construct the message
+            const eventCount = userEvents.length;
+            const title = `📅 Daily Digest: ${eventCount} Event${eventCount > 1 ? 's' : ''} Today`;
+
+            // Create a summary body (e.g., "1. Mom's Birthday\n2. Meeting...")
+            const bodyLines = userEvents
+                .slice(0, 3) // Show top 3
+                .map(e => `• ${e.title} (${new Date(e.next_alert_at).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})})`);
+
+            if (userEvents.length > 3) bodyLines.push(`...and ${userEvents.length - 3} more.`);
+
+            const body = bodyLines.join('\n');
+
+            // Send to all subscriptions for this device
             for (const subRecord of subs) {
                 try {
                     const payload = JSON.stringify({
-                        title: `Reminder: ${event.title}`,
-                        body: event.description || 'It is time!',
+                        title,
+                        body,
                         url: '/'
                     });
 
                     await webpush.sendNotification(subRecord.subscription, payload);
-                    notificationsSent.push(event.title);
+                    notificationsSent.push(deviceId);
                 } catch (err: any) {
-                    console.error(`Failed to push to device ${event.device_id}`, err);
+                    console.error(`Failed to push to device ${deviceId}`, err);
                     if (err.statusCode === 410 || err.statusCode === 404) {
-                        // Subscription is dead, clean it up
                         await supabase.from('subscriptions').delete().eq('id', subRecord.id);
                     }
                 }
             }
 
-            // 3. IMPORTANT: Update the event's next_alert_at to null or the NEXT occurrence
-            // Since calculating Lunar dates on server is hard without library,
-            // we just set it to NULL so it doesn't trigger again immediately.
-            // The FRONTEND is responsible for re-calculating the next occurrence when the user opens the app,
-            // OR we can implement a basic "add 1 day" logic here if strictly needed.
-            // For this MVP, setting to null prevents loop. The user must open app to schedule next loop.
-            // Alternatively: If it's a simple daily solar event, we could add logic here.
-
-            await supabase
-                .from('events')
-                .update({ next_alert_at: null }) // Stop alerting until app re-syncs
-                .eq('id', event.id);
+            // Note: We DO NOT clear next_alert_at here because the event hasn't technically happened yet.
+            // We rely on the Frontend App to open and recalculate the next occurrence,
+            // OR we rely on the next day's cron to pick up the next cycle if it's daily.
+            // If we want to force an update, we would need logic to "bump" the date, but doing that on server without Lunar library is risky.
+            // For a Digest, it is safe to just Notify and let the user handle the "Checking off".
         }
 
-        res.status(200).json({ success: true, sent: notificationsSent });
+        res.status(200).json({ success: true, devicesNotified: notificationsSent.length });
     } catch (error: any) {
         console.error('Cron failed:', error);
         res.status(500).json({ error: error.message });
