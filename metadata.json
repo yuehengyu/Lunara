@@ -1,0 +1,7 @@
+{
+  "name": "Lunara",
+  "description": "A smart event reminder app supporting recurring events and lunar calendar dates.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
