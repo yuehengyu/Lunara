@@ -1,3 +1,4 @@
+
 import React, { useState, useEffect } from 'react';
 import { AppEvent, RecurrenceRule } from '../types';
 import { X, Clock, Moon, Sun, Plus } from 'lucide-react';
@@ -20,34 +21,26 @@ const TIMEZONE_CN = 'Asia/Shanghai';
 const TIMEZONE_CA = 'America/Toronto';
 
 export const AddEventModal: React.FC<AddEventModalProps> = ({ isOpen, onClose, onSave, initialEvent }) => {
-  // Form States
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
 
-  // Date/Time Logic
   const [inputType, setInputType] = useState<'solar' | 'lunar'>('solar');
-  const [dateStr, setDateStr] = useState(''); // YYYY-MM-DD
+  const [dateStr, setDateStr] = useState('');
   const [timeStr, setTimeStr] = useState('09:00');
-
-  // Simplified Timezone: Default to Toronto if creating new, or use existing
   const [timezone, setTimezone] = useState(TIMEZONE_CA);
 
-  // Lunar Input Specifics
   const [lunarYear, setLunarYear] = useState(new Date().getFullYear());
   const [lunarMonth, setLunarMonth] = useState(1);
   const [lunarDay, setLunarDay] = useState(1);
 
-  // Recurrence Logic
   const [recurrenceType, setRecurrenceType] = useState<string>('none');
   const [customInterval, setCustomInterval] = useState(1);
   const [customUnit, setCustomUnit] = useState<'hour' | 'day' | 'week' | 'month' | 'year'>('day');
 
-  // Reminders Logic
   const [reminders, setReminders] = useState<CustomReminder[]>([]);
-  const [newReminderVal, setNewReminderVal] = useState(1);
-  const [newReminderUnit, setNewReminderUnit] = useState<'minutes'|'hours'|'days'>('hours');
+  const [newReminderVal, setNewReminderVal] = useState<number | ''>('');
+  const [newReminderUnit, setNewReminderUnit] = useState<'minutes'|'hours'|'days'>('minutes');
 
-  // Initialize form when opening
   useEffect(() => {
     if (isOpen) {
       if (initialEvent) {
@@ -56,12 +49,11 @@ export const AddEventModal: React.FC<AddEventModalProps> = ({ isOpen, onClose, o
         setDescription(initialEvent.description || '');
         setTimezone(initialEvent.timezone);
 
-        // Parse Date in the event's timezone
-        const dt = DateTime.fromISO(initialEvent.startAt).setZone(initialEvent.timezone);
+        // Parse from nextAlertAt
+        const dt = DateTime.fromISO(initialEvent.nextAlertAt).setZone(initialEvent.timezone);
         setDateStr(dt.toFormat('yyyy-MM-dd'));
         setTimeStr(dt.toFormat('HH:mm'));
 
-        // Recurrence setup
         if (initialEvent.recurrenceRule) {
           setRecurrenceType(initialEvent.recurrenceRule.type);
           if (initialEvent.recurrenceRule.type === 'custom') {
@@ -80,7 +72,6 @@ export const AddEventModal: React.FC<AddEventModalProps> = ({ isOpen, onClose, o
           setInputType('solar');
         }
 
-        // Reminders setup
         const parsedReminders: CustomReminder[] = (initialEvent.reminders || []).map(m => {
           if (m === 0) return { value: 0, unit: 'minutes' };
           if (m % 1440 === 0) return { value: m / 1440, unit: 'days' };
@@ -88,17 +79,22 @@ export const AddEventModal: React.FC<AddEventModalProps> = ({ isOpen, onClose, o
           return { value: m, unit: 'minutes' };
         });
         setReminders(parsedReminders);
+        setNewReminderVal('');
 
       } else {
-        // CREATE MODE (Reset)
+        // CREATE MODE
         setTitle('');
         setDescription('');
-        setDateStr(new Date().toISOString().split('T')[0]);
+
+        // Default date: Today
+        setDateStr(DateTime.now().setZone(TIMEZONE_CA).toFormat('yyyy-MM-dd'));
         setTimeStr('09:00');
-        setTimezone(TIMEZONE_CA); // Default to Canada
+        setTimezone(TIMEZONE_CA);
         setInputType('solar');
         setRecurrenceType('none');
-        setReminders([]);
+
+        setReminders([{ value: 0, unit: 'minutes' }]);
+        setNewReminderVal('');
 
         const lunarNow = Lunar.fromDate(new Date());
         setLunarYear(lunarNow.getYear());
@@ -111,7 +107,9 @@ export const AddEventModal: React.FC<AddEventModalProps> = ({ isOpen, onClose, o
   if (!isOpen) return null;
 
   const handleAddReminder = () => {
-    setReminders([...reminders, { value: newReminderVal, unit: newReminderUnit }]);
+    if (newReminderVal === '' || newReminderVal < 0) return;
+    setReminders([...reminders, { value: Number(newReminderVal), unit: newReminderUnit }]);
+    setNewReminderVal('');
   };
 
   const removeReminder = (index: number) => {
@@ -121,24 +119,31 @@ export const AddEventModal: React.FC<AddEventModalProps> = ({ isOpen, onClose, o
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
 
-    // 1. Calculate Start Date (ISO)
-    let finalIsoStart = '';
+    // 1. Calculate Next Alert Time
+    // We strictly use the selected Timezone to construct the ISO string.
+    let dt: DateTime;
 
     if (inputType === 'lunar') {
       try {
         const lunar = Lunar.fromYmd(lunarYear, lunarMonth, lunarDay);
         const solar = lunar.getSolar();
         const solarDateStr = `${solar.getYear()}-${String(solar.getMonth()).padStart(2, '0')}-${String(solar.getDay()).padStart(2, '0')}`;
-        // Create DT in the selected timezone
-        const dt = DateTime.fromISO(`${solarDateStr}T${timeStr}`, { zone: timezone });
-        finalIsoStart = dt.toISO() || new Date().toISOString();
+        dt = DateTime.fromISO(`${solarDateStr}T${timeStr}`, { zone: timezone });
       } catch (err) {
         alert("Invalid Lunar Date");
         return;
       }
     } else {
-      const dt = DateTime.fromISO(`${dateStr}T${timeStr}`, { zone: timezone });
-      finalIsoStart = dt.toISO() || new Date().toISOString();
+      dt = DateTime.fromISO(`${dateStr}T${timeStr}`, { zone: timezone });
+    }
+
+    // IMPORTANT: Ensure we send the full ISO string WITH the timezone offset.
+    // e.g. "2024-12-18T09:00:00.000-05:00"
+    const nextAlertAt = dt.toISO();
+
+    if (!nextAlertAt) {
+      alert("Invalid Date/Time selection");
+      return;
     }
 
     // 2. Build Recurrence Rule
@@ -156,7 +161,7 @@ export const AddEventModal: React.FC<AddEventModalProps> = ({ isOpen, onClose, o
           rule.type = 'yearly_lunar';
           rule.lunarData = { month: lunarMonth, day: lunarDay };
         } else {
-          const dt = DateTime.fromISO(finalIsoStart).setZone(timezone);
+          // If they selected Solar but want Lunar recurrence, convert current date to Lunar
           const lunar = Lunar.fromDate(dt.toJSDate());
           rule.type = 'yearly_lunar';
           rule.lunarData = { month: lunar.getMonth(), day: lunar.getDay() };
@@ -164,8 +169,15 @@ export const AddEventModal: React.FC<AddEventModalProps> = ({ isOpen, onClose, o
       }
     }
 
-    // 3. Convert Reminders
-    const reminderMinutes = reminders.map(r => {
+    // 3. Reminders
+    let finalReminders = [...reminders];
+    if (newReminderVal !== '' && Number(newReminderVal) >= 0) {
+      const pendingVal = Number(newReminderVal);
+      const isDuplicate = finalReminders.some(r => r.value === pendingVal && r.unit === newReminderUnit);
+      if (!isDuplicate) finalReminders.push({ value: pendingVal, unit: newReminderUnit });
+    }
+
+    const reminderMinutes = finalReminders.map(r => {
       if (r.value === 0) return 0;
       if (r.unit === 'days') return r.value * 1440;
       if (r.unit === 'hours') return r.value * 60;
@@ -176,7 +188,7 @@ export const AddEventModal: React.FC<AddEventModalProps> = ({ isOpen, onClose, o
       id: initialEvent?.id || crypto.randomUUID(),
       title,
       description,
-      startAt: finalIsoStart,
+      nextAlertAt: nextAlertAt, // THE SOURCE OF TRUTH
       isAllDay: false,
       timezone,
       recurrenceRule: rule,
@@ -192,7 +204,6 @@ export const AddEventModal: React.FC<AddEventModalProps> = ({ isOpen, onClose, o
   return (
       <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
         <div className="bg-white rounded-xl w-full max-w-lg shadow-2xl flex flex-col max-h-[90vh]">
-          {/* Header */}
           <div className="p-5 border-b border-slate-100 flex justify-between items-center bg-slate-50 rounded-t-xl shrink-0">
             <h2 className="text-xl font-bold text-slate-800">
               {initialEvent ? 'Edit Event' : 'New Event'}
@@ -202,10 +213,7 @@ export const AddEventModal: React.FC<AddEventModalProps> = ({ isOpen, onClose, o
             </button>
           </div>
 
-          {/* Scrollable Content */}
           <div className="p-6 overflow-y-auto space-y-6">
-
-            {/* Title & Description */}
             <div className="space-y-3">
               <input
                   required
@@ -220,13 +228,12 @@ export const AddEventModal: React.FC<AddEventModalProps> = ({ isOpen, onClose, o
                   onChange={e => setDescription(e.target.value)}
                   rows={2}
                   className="w-full text-sm text-slate-600 placeholder:text-slate-300 border border-slate-200 rounded-lg p-3 focus:ring-2 focus:ring-indigo-500/10 focus:border-indigo-500 transition-all resize-none"
-                  placeholder="Add details..."
+                  placeholder="Add description..."
               />
             </div>
 
-            {/* Region / Timezone Selector - SIMPLIFIED */}
             <div className="space-y-2">
-              <label className="block text-xs font-bold text-slate-400 uppercase tracking-wide">Where is this event?</label>
+              <label className="block text-xs font-bold text-slate-400 uppercase tracking-wide">Timezone</label>
               <div className="grid grid-cols-2 gap-3">
                 <button
                     type="button"
@@ -250,9 +257,7 @@ export const AddEventModal: React.FC<AddEventModalProps> = ({ isOpen, onClose, o
               </div>
             </div>
 
-            {/* Date & Time Section */}
             <div className="bg-slate-50 p-4 rounded-xl space-y-4 border border-slate-100">
-              {/* Input Type Toggle */}
               <div className="flex bg-white rounded-lg p-1 border border-slate-200 w-fit">
                 <button
                     type="button"
@@ -270,7 +275,6 @@ export const AddEventModal: React.FC<AddEventModalProps> = ({ isOpen, onClose, o
                 </button>
               </div>
 
-              {/* Date Inputs */}
               <div className="grid grid-cols-2 gap-4">
                 {inputType === 'solar' ? (
                     <div>
@@ -291,7 +295,7 @@ export const AddEventModal: React.FC<AddEventModalProps> = ({ isOpen, onClose, o
                       <div>
                         <label className="block text-xs font-semibold text-slate-400 uppercase mb-1">Month</label>
                         <select value={lunarMonth} onChange={e => setLunarMonth(Number(e.target.value))} className="w-full bg-white border border-slate-200 rounded-lg px-2 py-2 text-sm">
-                          {Array.from({length: 12}, (_, i) => i + 1).map(m => <option key={m} value={m}>{m}月</option>)}
+                          {Array.from({length: 12}, (_, i) => i + 1).map(m => <option key={m} value={m}>{m} Month</option>)}
                         </select>
                       </div>
                       <div>
@@ -315,20 +319,26 @@ export const AddEventModal: React.FC<AddEventModalProps> = ({ isOpen, onClose, o
               </div>
             </div>
 
-            {/* Recurrence & Reminder Split */}
             <div className="grid grid-cols-1 gap-6">
-              {/* Recurrence */}
               <div>
-                <label className="block text-xs font-bold text-slate-400 uppercase mb-2 tracking-wide">Repeat</label>
+                <label className="block text-xs font-bold text-slate-400 uppercase mb-2 tracking-wide">Recurrence</label>
                 <div className="flex flex-wrap gap-2">
-                  {['none', 'daily', 'weekly', 'monthly', 'yearly_solar', 'yearly_lunar', 'custom'].map((type) => (
+                  {[
+                    { id: 'none', label: 'None' },
+                    { id: 'daily', label: 'Daily' },
+                    { id: 'weekly', label: 'Weekly' },
+                    { id: 'monthly', label: 'Monthly' },
+                    { id: 'yearly_solar', label: 'Yearly' },
+                    { id: 'yearly_lunar', label: 'Yearly (Lunar)' },
+                    { id: 'custom', label: 'Custom' }
+                  ].map((item) => (
                       <button
-                          key={type}
+                          key={item.id}
                           type="button"
-                          onClick={() => setRecurrenceType(type)}
-                          className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-all ${recurrenceType === type ? 'bg-indigo-600 text-white border-indigo-600 shadow-sm' : 'bg-white text-slate-600 border-slate-200 hover:border-slate-300'}`}
+                          onClick={() => setRecurrenceType(item.id)}
+                          className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-all ${recurrenceType === item.id ? 'bg-indigo-600 text-white border-indigo-600 shadow-sm' : 'bg-white text-slate-600 border-slate-200 hover:border-slate-300'}`}
                       >
-                        {type === 'yearly_solar' ? 'Yearly' : type === 'yearly_lunar' ? 'Yearly (Lunar)' : type === 'none' ? 'Never' : type.replace('_', ' ')}
+                        {item.label}
                       </button>
                   ))}
                 </div>
@@ -347,27 +357,32 @@ export const AddEventModal: React.FC<AddEventModalProps> = ({ isOpen, onClose, o
                           onChange={e => setCustomUnit(e.target.value as any)}
                           className="px-2 py-1 border border-slate-200 rounded-md text-sm bg-white"
                       >
-                        <option value="hour">Hours</option>
-                        <option value="day">Days</option>
-                        <option value="week">Weeks</option>
-                        <option value="month">Months</option>
-                        <option value="year">Years</option>
+                        <option value="hour">hour</option>
+                        <option value="day">day</option>
+                        <option value="week">week</option>
+                        <option value="month">month</option>
+                        <option value="year">year</option>
                       </select>
                     </div>
                 )}
               </div>
 
-              {/* Reminders */}
               <div>
                 <label className="block text-xs font-bold text-slate-400 uppercase mb-2 tracking-wide flex items-center gap-2">
                   <Clock className="w-3 h-3" /> Reminders
                 </label>
 
+                {reminders.length === 0 && (
+                    <div className="text-xs text-slate-400 mb-2 italic">
+                      No reminders set. Add one below.
+                    </div>
+                )}
+
                 <div className="flex flex-wrap gap-2 mb-3">
                   {reminders.map((rem, idx) => (
                       <div key={idx} className="flex items-center gap-2 bg-amber-50 px-3 py-1.5 rounded-full border border-amber-100">
                     <span className="text-xs font-medium text-amber-800">
-                      {rem.value === 0 ? 'Exact Time' : `${rem.value} ${rem.unit} before`}
+                      {rem.value === 0 ? 'On time' : `Before ${rem.value} ${rem.unit === 'minutes' ? 'min' : rem.unit === 'hours' ? 'hr' : 'day'}`}
                     </span>
                         <button type="button" onClick={() => removeReminder(idx)} className="text-amber-500 hover:text-red-500">
                           <X className="w-3 h-3" />
@@ -380,7 +395,8 @@ export const AddEventModal: React.FC<AddEventModalProps> = ({ isOpen, onClose, o
                   <input
                       type="number" min="0"
                       value={newReminderVal}
-                      onChange={e => setNewReminderVal(Math.max(0, parseInt(e.target.value)))}
+                      placeholder="#"
+                      onChange={e => setNewReminderVal(e.target.value === '' ? '' : Math.max(0, parseInt(e.target.value)))}
                       className="w-16 px-2 py-1.5 border border-slate-200 rounded-md text-sm"
                   />
                   <select
@@ -388,15 +404,15 @@ export const AddEventModal: React.FC<AddEventModalProps> = ({ isOpen, onClose, o
                       onChange={e => setNewReminderUnit(e.target.value as any)}
                       className="px-2 py-1.5 border border-slate-200 rounded-md text-sm bg-white"
                   >
-                    <option value="minutes">Mins</option>
-                    <option value="hours">Hours</option>
-                    <option value="days">Days</option>
+                    <option value="minutes">min</option>
+                    <option value="hours">hr</option>
+                    <option value="days">day</option>
                   </select>
                   <span className="text-sm text-slate-400">before</span>
                   <button
                       type="button"
                       onClick={handleAddReminder}
-                      className="ml-auto flex items-center gap-1 bg-indigo-50 text-indigo-600 px-3 py-1.5 rounded-md text-sm font-medium hover:bg-indigo-100"
+                      className="ml-auto flex items-center gap-1 bg-indigo-50 text-indigo-600 px-3 py-1.5 rounded-md text-sm font-medium hover:bg-indigo-100 border border-indigo-100"
                   >
                     <Plus className="w-4 h-4" /> Add
                   </button>
@@ -405,7 +421,6 @@ export const AddEventModal: React.FC<AddEventModalProps> = ({ isOpen, onClose, o
             </div>
           </div>
 
-          {/* Footer */}
           <div className="p-4 border-t border-slate-100 bg-slate-50 rounded-b-xl shrink-0">
             <button
                 onClick={handleSubmit}

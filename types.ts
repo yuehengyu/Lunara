@@ -21,8 +21,9 @@ export interface AppEvent {
   title: string;
   description?: string;
 
-  // Stored as ISO string with offset (timestamptz in DB)
-  startAt: string;
+  // PRIMARY TIME FIELD: Stored as ISO string with offset
+  nextAlertAt: string;
+
   endAt?: string;
   isAllDay: boolean;
 
@@ -34,8 +35,6 @@ export interface AppEvent {
   // Array of minutes before event to notify
   reminders: number[];
 
-  // Backend Push Fields
-  nextAlertAt?: string | null; // The calculated ISO string for the NEXT push
   deviceId?: string; // Links event to the device that created it
 
   createdAt: string;

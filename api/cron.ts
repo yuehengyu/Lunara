@@ -26,15 +26,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     try {
         // STRICT "Tomorrow Calendar Day" Logic (Toronto Time)
-        // 1. Get current time in Toronto
         const nowToronto = DateTime.now().setZone('America/Toronto');
-
-        // 2. Define "Tomorrow" as the full calendar day (00:00 - 23:59)
         const targetStart = nowToronto.plus({ days: 1 }).startOf('day');
         const targetEnd = nowToronto.plus({ days: 1 }).endOf('day');
 
         console.log(`Cron: Scanning events. Target Window (Toronto): ${targetStart.toFormat('yyyy-MM-dd HH:mm')} - ${targetEnd.toFormat('HH:mm')}`);
 
+        // We only need next_alert_at now.
         const { data: events } = await supabase
             .from('events')
             .select('*');
@@ -50,13 +48,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         // 3. Process Events
         for (const event of events) {
             // CLEANUP LOGIC:
-            // Check deletion based on actual time passed (UTC comparison is safest for "past")
-            const eventTimeUtc = DateTime.fromISO(event.start_at).toUTC();
             const nowUtc = DateTime.now().toUTC();
+            // Use next_alert_at strictly
+            const nextAlertUtc = DateTime.fromISO(event.next_alert_at).toUTC();
             const isOneTime = !event.recurrence_rule || event.recurrence_rule.type === 'none' || !event.recurrence_rule.type;
 
-            // Delete if passed > 2 hours ago
-            if (isOneTime && eventTimeUtc < nowUtc.minus({ hours: 2 })) {
+            // Delete if passed > 2 hours ago (server side safety net, client deletes at 1 min)
+            if (isOneTime && nextAlertUtc < nowUtc.minus({ hours: 2 })) {
                 eventsToDelete.push(event.id);
                 continue;
             }
@@ -64,13 +62,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             // NOTIFICATION LOGIC:
             if (!event.device_id) continue;
 
-            // Base time for calculation. Prefer next_alert_at, fallback to start_at
-            // We convert this base time to Toronto timezone to perform arithmetic correctly relative to user expectations if needed,
-            // but Luxon handles subtraction correctly regardless of zone.
-            // Crucially, we map the RESULT (alertTime) to Toronto to compare with targetStart/End.
-            const alertBaseTime = event.next_alert_at
-                ? DateTime.fromISO(event.next_alert_at).setZone('America/Toronto')
-                : DateTime.fromISO(event.start_at).setZone('America/Toronto');
+            // Base time for calculation. Strictly use next_alert_at
+            const alertBaseTime = DateTime.fromISO(event.next_alert_at).setZone('America/Toronto');
 
             const reminders = event.reminders || [0];
 
@@ -89,8 +82,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
                     if (minutesBefore === 0) {
                         label = `• ${displayTime.toFormat('HH:mm')} - ${event.title}`;
                     } else if (minutesBefore === 1440) {
-                        // Reminder is "1 Day Before", meaning the EVENT is the day AFTER tomorrow
-                        // But the ALERT is Tomorrow.
                         label = `• Reminder: ${event.title} is coming up on ${displayTime.toFormat('MMM dd')}`;
                     } else if (minutesBefore > 1440) {
                         const days = Math.round(minutesBefore / 1440);

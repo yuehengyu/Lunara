@@ -17,13 +17,13 @@ const mapFromDb = (row: any): AppEvent => ({
   id: row.id,
   title: row.title,
   description: row.description,
-  startAt: row.start_at,
+  // START_AT IS REMOVED. Map next_alert_at to the primary time field.
+  nextAlertAt: row.next_alert_at,
   endAt: row.end_at,
   isAllDay: row.is_all_day,
   timezone: row.timezone || 'America/Toronto',
   recurrenceRule: row.recurrence_rule,
   reminders: row.reminders || [],
-  nextAlertAt: row.next_alert_at,
   deviceId: row.device_id,
   createdAt: row.created_at,
   updatedAt: row.updated_at,
@@ -34,14 +34,14 @@ const mapToDb = (event: AppEvent) => ({
   id: event.id,
   title: event.title,
   description: event.description,
-  start_at: event.startAt,
+  // START_AT IS REMOVED. strictly use next_alert_at
+  next_alert_at: event.nextAlertAt,
   end_at: event.endAt,
   is_all_day: event.isAllDay,
   timezone: event.timezone,
   recurrence_rule: event.recurrenceRule,
   reminders: event.reminders,
-  next_alert_at: event.nextAlertAt, // Critical for Cron Job
-  device_id: event.deviceId,       // Critical for targeting
+  device_id: event.deviceId,
 });
 
 export const fetchEvents = async (deviceId?: string): Promise<AppEvent[]> => {
@@ -50,11 +50,7 @@ export const fetchEvents = async (deviceId?: string): Promise<AppEvent[]> => {
   let query = supabase
       .from('events')
       .select('*')
-      .order('created_at', { ascending: false });
-
-  // If we have a deviceId, simpler apps might filter by it,
-  // but for now we fetch all (shared mode) or you can uncomment below to isolate:
-  // if (deviceId) query = query.eq('device_id', deviceId);
+      .order('next_alert_at', { ascending: true }); // Order by next alert time directly
 
   const { data, error } = await query;
 
@@ -66,29 +62,38 @@ export const fetchEvents = async (deviceId?: string): Promise<AppEvent[]> => {
   return data ? data.map(mapFromDb) : [];
 };
 
-// NEW: Clean up expired one-time events from the frontend on load
-export const cleanupPastEvents = async (events: AppEvent[]) => {
-  if (!supabase) return;
+// Clean up expired one-time events
+// Returns the IDs of deleted events so UI can update immediately
+export const cleanupPastEvents = async (events: AppEvent[]): Promise<string[]> => {
+  if (!supabase) return [];
 
-  const now = DateTime.now();
+  // Compare in UTC to be absolute, but based on the event's specific moment
+  const now = DateTime.now().toUTC();
   const toDelete: string[] = [];
 
   events.forEach(e => {
-    // If it has NO recurrence rule
+    // Only delete if NO recurrence rule (One-time events)
     if (!e.recurrenceRule || e.recurrenceRule.type === 'none') {
-      const eventTime = DateTime.fromISO(e.startAt, { zone: e.timezone });
-      // Reduce buffer to 2 hours
-      if (eventTime.plus({ hours: 2 }) < now) {
+
+      // Strict parsing of the Next Alert Time
+      const eventTime = DateTime.fromISO(e.nextAlertAt).setZone(e.timezone).toUTC();
+
+      if (!eventTime.isValid) return;
+
+      // Delete immediately if 1 minute has passed
+      if (eventTime.plus({ minutes: 1 }) < now) {
         toDelete.push(e.id);
       }
     }
   });
 
   if (toDelete.length > 0) {
-    console.log(`Auto-deleting ${toDelete.length} past events...`);
-    const { error } = await supabase.from('events').delete().in('id', toDelete);
-    if (error) console.error("Auto-delete failed:", error);
-    return toDelete; // Return IDs so UI can update state locally
+    console.log(`[Storage] Identifying ${toDelete.length} past events for deletion.`);
+    // Fire and forget the DB delete, but return IDs for UI to update NOW
+    supabase.from('events').delete().in('id', toDelete).then(({ error }) => {
+      if (error) console.error("DB Auto-delete failed:", error);
+    });
+    return toDelete;
   }
   return [];
 };
@@ -126,18 +131,13 @@ export const updateEvent = async (event: AppEvent) => {
   if (error) console.error('Error updating event:', error);
 };
 
-// New: Save Push Subscription
 export const saveSubscription = async (deviceId: string, subscription: PushSubscription) => {
   if (!supabase) return;
 
-  // Basic upsert logic: delete old for this device, insert new
-  // In a real app with Auth, you'd tie this to User ID.
   await supabase.from('subscriptions').delete().eq('device_id', deviceId);
-
   const { error } = await supabase.from('subscriptions').insert({
     device_id: deviceId,
     subscription: subscription.toJSON()
   });
-
   if (error) console.error('Failed to save subscription', error);
 };
