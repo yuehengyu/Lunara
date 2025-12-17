@@ -1,6 +1,6 @@
 
 import React, { useState, useEffect, useCallback } from 'react';
-import { Plus, Bell, Calendar as CalendarIcon, List, Database, Loader2, Info, X, Radio } from 'lucide-react';
+import { Plus, Bell, Calendar as CalendarIcon, List, Database, Loader2, Info, X, Radio, Send, RotateCw } from 'lucide-react';
 import { AppEvent } from './types';
 import { fetchEvents, createEvent, deleteEvent, updateEvent, isSupabaseConfigured, saveSubscription } from './services/storage';
 import { checkNotifications, getNextOccurrence, shouldUpdateRecurringEvent } from './services/timeService';
@@ -29,6 +29,8 @@ const App: React.FC = () => {
   const [isLoading, setIsLoading] = useState(true);
   const [showMobileTip, setShowMobileTip] = useState(true);
   const [deviceId, setDeviceId] = useState<string>('');
+  const [isTestingPush, setIsTestingPush] = useState(false);
+  const [isCheckingDigest, setIsCheckingDigest] = useState(false);
 
   const [triggerEvent, setTriggerEvent] = useState<AppEvent | null>(null);
   const [notifiedLog, setNotifiedLog] = useState<Set<string>>(new Set());
@@ -97,9 +99,61 @@ const App: React.FC = () => {
     }
   };
 
+  const handleTestPush = async () => {
+    if (permission !== 'granted') {
+      alert("Please enable push notifications first.");
+      return;
+    }
+    setIsTestingPush(true);
+    try {
+      const res = await fetch('/api/test-push', {
+        method: 'POST',
+        body: JSON.stringify({ deviceId }),
+        headers: { 'Content-Type': 'application/json' }
+      });
+      const data = await res.json();
+      if (data.success) {
+        alert("Test notification sent! Check your notification center.");
+      } else {
+        alert("Failed to send test: " + (data.error || 'Unknown error'));
+      }
+    } catch (e) {
+      alert("Error sending test request");
+    } finally {
+      setIsTestingPush(false);
+    }
+  };
+
+  const handleTriggerDigest = async () => {
+    if (permission !== 'granted') {
+      alert("Please enable push notifications first.");
+      return;
+    }
+    setIsCheckingDigest(true);
+    try {
+      const res = await fetch('/api/trigger-digest', {
+        method: 'POST',
+      });
+      const data = await res.json();
+      if (data.success) {
+        if (data.eventsFound > 0) {
+          alert(`Success! Found ${data.eventsFound} upcoming events and sent to ${data.devicesNotified} devices.`);
+        } else {
+          alert("Check complete, but no events found in the next 24 hours.");
+        }
+      } else {
+        alert("Check completed: " + (data.message || data.error));
+      }
+    } catch (e) {
+      alert("Error triggering check.");
+    } finally {
+      setIsCheckingDigest(false);
+    }
+  };
+
   // Local Polling for foreground alerts
   useEffect(() => {
-    const intervalId = setInterval(async () => {
+    const intervalId = window.setInterval(async () => {
       // 1. Check Foreground Notifications
       checkNotifications(events, (event, text) => {
         const key = `${event.id}-${new Date().getMinutes()}`;
@@ -138,13 +192,11 @@ const App: React.FC = () => {
       }
     }, 5000);
 
-    return () => clearInterval(intervalId);
+    return () => window.clearInterval(intervalId);
   }, [events, permission, notifiedLog]);
 
   const handleSaveEvent = async (event: AppEvent) => {
     // CRITICAL: Calculate the Next Alert Timestamp BEFORE saving to DB
-    // This allows the simple Backend Cron Job to just check "is nextAlertAt < now?"
-    // without needing complex lunar libraries on the server.
     const nextOcc = getNextOccurrence(event);
 
     const eventWithMeta: AppEvent = {
@@ -204,6 +256,31 @@ const App: React.FC = () => {
           </div>
 
           <div className="flex items-center gap-2 sm:gap-3">
+            {/* Test Button for immediate feedback */}
+            {permission === 'granted' && (
+                <>
+                  <button
+                      onClick={handleTestPush}
+                      disabled={isTestingPush}
+                      className="flex items-center gap-1.5 text-xs sm:text-sm text-slate-600 bg-white px-3 py-2 rounded-full hover:bg-slate-50 border border-slate-200 transition-colors"
+                      title="Send a sample notification now"
+                  >
+                    <Send className="w-3.5 h-3.5" />
+                    <span className="hidden sm:inline">{isTestingPush ? 'Sending...' : 'Test'}</span>
+                  </button>
+
+                  <button
+                      onClick={handleTriggerDigest}
+                      disabled={isCheckingDigest}
+                      className="flex items-center gap-1.5 text-xs sm:text-sm text-indigo-700 bg-indigo-50 px-3 py-2 rounded-full hover:bg-indigo-100 border border-indigo-200 transition-colors"
+                      title="Manually trigger the backend check for upcoming events"
+                  >
+                    <RotateCw className={`w-3.5 h-3.5 ${isCheckingDigest ? 'animate-spin' : ''}`} />
+                    <span className="hidden sm:inline">{isCheckingDigest ? 'Checking...' : 'Check Upcoming'}</span>
+                  </button>
+                </>
+            )}
+
             {permission !== 'granted' && (
                 <button
                     onClick={enablePushNotifications}
@@ -241,7 +318,7 @@ const App: React.FC = () => {
                 <div className="pr-4">
                   <p className="text-sm font-semibold">Real Push Notifications</p>
                   <p className="text-xs sm:text-sm mt-1 text-blue-700/80">
-                    Click "Enable Push" to receive notifications even when the app is closed. This uses Vercel Cron Jobs to check your events every minute.
+                    Click "Enable Push" to receive notifications even when the app is closed. This uses Vercel Cron Jobs to check your events.
                   </p>
                 </div>
                 <button
