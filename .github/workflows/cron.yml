@@ -1,0 +1,21 @@
+
+name: High Frequency Cron Trigger
+
+on:
+  schedule:
+    # Run every 10 minutes
+    - cron: '*/10 * * * *'
+  workflow_dispatch: # Allows manual trigger from GitHub UI
+
+jobs:
+  ping-cron:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call Vercel Cron Endpoint
+        # 1. Go to GitHub Repo -> Settings -> Secrets and variables -> Actions
+        # 2. Click "New repository secret"
+        # 3. Name: VERCEL_PROJECT_URL
+        # 4. Value: https://your-project.vercel.app (No trailing slash)
+        run: |
+          echo "Triggering Cron..."
+          curl -v -X POST "${{ secrets.VERCEL_PROJECT_URL || 'https://lunara-psi.vercel.app' }}/api/cron"

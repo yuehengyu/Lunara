@@ -6,15 +6,19 @@ self.addEventListener('activate', (event) => {
     event.waitUntil(self.clients.claim());
 });
 
-// Placeholder for future Web Push event
 self.addEventListener('push', (event) => {
     const data = event.data ? event.data.json() : {};
     const title = data.title || 'LunaRemind';
+
     const options = {
         body: data.body || 'Event Reminder',
-        icon: '/icon.png',
+        icon: '/icon.png', // Ensure you have this icon or it might fail silently on some browsers
         badge: '/icon.png',
-        data: data.url || '/'
+        data: data.url || '/',
+        // CRITICAL for Lock Screen visibility:
+        requireInteraction: true, // Keeps notification until user dismisses it
+        renotify: true, // Vibrate/Sound again even if old notification is there
+        tag: 'luna-reminder' // Groups notifications
     };
 
     event.waitUntil(self.registration.showNotification(title, options));

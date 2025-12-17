@@ -1,6 +1,6 @@
 
-import React, { useState, useEffect } from 'react';
-import { Plus, Bell, Calendar as CalendarIcon, Loader2, X, Radio, Send, RotateCw } from 'lucide-react';
+import React, { useState, useEffect, useRef } from 'react';
+import { Plus, Bell, Calendar as CalendarIcon, Loader2, X, Radio, Send, RotateCw, Zap, ZapOff, Copy, Info, Github } from 'lucide-react';
 import { AppEvent } from './types';
 import { fetchEvents, createEvent, deleteEvent, updateEvent, isSupabaseConfigured, saveSubscription, cleanupPastEvents } from './services/storage';
 import { checkNotifications, getNextOccurrence, shouldUpdateRecurringEvent } from './services/timeService';
@@ -44,6 +44,11 @@ const App: React.FC = () => {
   const [deviceId, setDeviceId] = useState<string>('');
   const [isTestingPush, setIsTestingPush] = useState(false);
   const [isCheckingDigest, setIsCheckingDigest] = useState(false);
+  const [showDevInfo, setShowDevInfo] = useState(false);
+
+  // Wake Lock State
+  const [wakeLock, setWakeLock] = useState<WakeLockSentinel | null>(null);
+  const [isStandbyMode, setIsStandbyMode] = useState(false);
 
   const [triggerEvent, setTriggerEvent] = useState<AppEvent | null>(null);
   const [notifiedLog, setNotifiedLog] = useState<Set<string>>(new Set());
@@ -87,6 +92,50 @@ const App: React.FC = () => {
       setPermission(Notification.permission);
     }
   }, [deviceId]);
+
+  // Wake Lock Management
+  const toggleStandbyMode = async () => {
+    if (!('wakeLock' in navigator)) {
+      alert("Wake Lock is not supported on this browser.");
+      return;
+    }
+
+    try {
+      if (wakeLock) {
+        await wakeLock.release();
+        setWakeLock(null);
+        setIsStandbyMode(false);
+      } else {
+        const sentinel = await navigator.wakeLock.request('screen');
+        setWakeLock(sentinel);
+        setIsStandbyMode(true);
+        sentinel.addEventListener('release', () => {
+          setWakeLock(null);
+          setIsStandbyMode(false);
+        });
+      }
+    } catch (err: any) {
+      console.error(`${err.name}, ${err.message}`);
+      alert("Could not activate Standby Mode (Battery Saver might be on)");
+    }
+  };
+
+  // Re-acquire Wake Lock on visibility change
+  useEffect(() => {
+    const handleVisibilityChange = async () => {
+      if (document.visibilityState === 'visible' && isStandbyMode && !wakeLock) {
+        try {
+          const sentinel = await navigator.wakeLock.request('screen');
+          setWakeLock(sentinel);
+        } catch (e) {
+          console.error("Failed to re-acquire wake lock", e);
+        }
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
+  }, [isStandbyMode, wakeLock]);
+
 
   // Push Subscription Logic
   useEffect(() => {
@@ -186,9 +235,8 @@ const App: React.FC = () => {
       const res = await fetch('/api/trigger-digest', { method: 'POST' });
       const data = await res.json();
       if (data.success) {
-        alert(`Found ${data.matchedAlerts} alerts for tomorrow.`);
+        alert(`Server Scan: ${data.matchedAlerts} alerts upcoming.\n(Use this to check if server-side push works)`);
         if (data.eventsDeleted > 0) {
-          // Re-fetch to sync state if backend deleted things
           const newData = await fetchEvents(deviceId);
           setEvents(newData);
         }
@@ -200,16 +248,41 @@ const App: React.FC = () => {
     }
   };
 
+  const handleCopyHost = () => {
+    // Copy only the origin, e.g., https://my-app.vercel.app
+    const url = window.location.origin;
+    navigator.clipboard.writeText(url).then(() => {
+      alert(`Copied Project URL: ${url}\n\nNow go to GitHub -> Settings -> Secrets -> Actions -> New Secret\nName: VERCEL_PROJECT_URL\nValue: (Paste this URL)`);
+    });
+  };
+
   // MAIN LOOP: Check for updates every 5 seconds
   useEffect(() => {
     const intervalId = window.setInterval(async () => {
 
       // 1. Check Alarms
-      checkNotifications(events, (event, text) => {
+      checkNotifications(events, async (event, text) => {
         const key = `${event.id}-${new Date().getMinutes()}`;
         if (!notifiedLog.has(key)) {
+          // A. Trigger In-App UI
           setTriggerEvent(event);
           setNotifiedLog(prev => new Set(prev).add(key));
+
+          // B. Trigger System Notification (Works if app is backgrounded but not frozen)
+          if (Notification.permission === 'granted' && 'serviceWorker' in navigator) {
+            try {
+              const registration = await navigator.serviceWorker.ready;
+              registration.showNotification(`🔔 ${event.title}`, {
+                body: `${text}. ${event.description || ''}`,
+                icon: 'data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🌙</text></svg>',
+                tag: key, // Prevent duplicates
+                requireInteraction: true,
+                vibrate: [200, 100, 200]
+              } as any);
+            } catch (e) {
+              console.error("System notification failed", e);
+            }
+          }
         }
       });
 
@@ -257,12 +330,10 @@ const App: React.FC = () => {
     };
 
     if (editingEvent) {
-      // Optimistic Update
       setEvents(prev => prev.map(e => e.id === event.id ? eventWithMeta : e));
       await updateEvent(eventWithMeta);
       setEditingEvent(null);
     } else {
-      // Optimistic Update
       setEvents(prev => [...prev, eventWithMeta]);
       await createEvent(eventWithMeta);
     }
@@ -281,51 +352,77 @@ const App: React.FC = () => {
     }
   };
 
-  const displayedEvents = [...events].sort((a, b) => {
-    return new Date(a.nextAlertAt).getTime() - new Date(b.nextAlertAt).getTime();
-  });
+  // Filter and Sort Events
+  const displayedEvents = events
+      .filter(event => {
+        if (activeTab === 'all') return true;
+        if (activeTab === 'upcoming') {
+          const now = DateTime.now();
+          const eventDate = DateTime.fromISO(event.nextAlertAt);
+          const diffInDays = eventDate.diff(now, 'days').days;
+          return diffInDays >= -0.1 && diffInDays <= 7;
+        }
+        return true;
+      })
+      .sort((a, b) => {
+        return new Date(a.nextAlertAt).getTime() - new Date(b.nextAlertAt).getTime();
+      });
 
   return (
-      <div className="min-h-screen bg-slate-50 flex flex-col items-center py-4 px-4 sm:py-8 pb-24 sm:pb-8 font-sans">
+      <div className={`min-h-screen flex flex-col items-center py-4 px-4 sm:py-8 pb-24 sm:pb-8 font-sans transition-colors duration-500 ${isStandbyMode ? 'bg-black text-slate-200' : 'bg-slate-50 text-slate-900'}`}>
         <AlarmPopup
             event={triggerEvent}
             onClose={() => setTriggerEvent(null)}
             onSnooze={() => setTriggerEvent(null)}
         />
 
-        <header className="w-full max-w-3xl mb-6 flex justify-between items-center sticky top-0 bg-slate-50 z-10 py-2">
+        <header className={`w-full max-w-3xl mb-6 flex justify-between items-center sticky top-0 z-10 py-2 transition-colors ${isStandbyMode ? 'bg-black' : 'bg-slate-50'}`}>
           <div>
-            <h1 className="text-2xl sm:text-3xl font-bold text-slate-900 tracking-tight flex items-center gap-2">
+            <h1 className="text-2xl sm:text-3xl font-bold tracking-tight flex items-center gap-2">
               <span className="bg-indigo-600 text-white p-1.5 rounded-lg text-lg sm:text-xl shadow-sm">LR</span>
               LunaRemind
             </h1>
-            <p className="text-xs sm:text-sm text-slate-500 mt-1">
-              {isSupabaseConfigured ? 'Cloud Sync Active' : 'Offline Mode'}
+            <p className={`text-xs sm:text-sm mt-1 flex items-center gap-2 ${isStandbyMode ? 'text-green-400' : 'text-slate-500'}`}>
+              {isStandbyMode ? <><Zap className="w-3 h-3"/> Standby Active (Screen On)</> : (isSupabaseConfigured ? 'Cloud Sync Active' : 'Offline Mode')}
             </p>
           </div>
 
           <div className="flex items-center gap-2 sm:gap-3">
+            {/* Standby Toggle */}
+            <button
+                onClick={toggleStandbyMode}
+                className={`flex items-center gap-1.5 text-xs sm:text-sm px-3 py-2 rounded-full border transition-colors ${
+                    isStandbyMode
+                        ? 'bg-amber-900/50 text-amber-200 border-amber-800 hover:bg-amber-900'
+                        : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'
+                }`}
+                title="Keep screen on (for alarms)"
+            >
+              {isStandbyMode ? <Zap className="w-4 h-4 text-amber-400 fill-amber-400" /> : <ZapOff className="w-4 h-4" />}
+            </button>
+
             {permission === 'granted' && (
                 <>
                   <button
                       onClick={handleTestPush}
                       disabled={isTestingPush}
-                      className="flex items-center gap-1.5 text-xs sm:text-sm text-slate-600 bg-white px-3 py-2 rounded-full hover:bg-slate-50 border border-slate-200 transition-colors"
+                      className={`flex items-center gap-1.5 text-xs sm:text-sm px-3 py-2 rounded-full border transition-colors ${isStandbyMode ? 'bg-gray-800 border-gray-700 text-gray-300' : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'}`}
+                      title="Test Server Push"
                   >
                     <Send className="w-3.5 h-3.5" />
-                  </button>
-
-                  <button
-                      onClick={handleTriggerDigest}
-                      disabled={isCheckingDigest}
-                      className="flex items-center gap-1.5 text-xs sm:text-sm text-indigo-700 bg-indigo-50 px-3 py-2 rounded-full hover:bg-indigo-100 border border-indigo-200 transition-colors"
-                  >
-                    <RotateCw className={`w-3.5 h-3.5 ${isCheckingDigest ? 'animate-spin' : ''}`} />
                   </button>
                 </>
             )}
 
-            {permission !== 'granted' ? (
+            <button
+                onClick={() => setShowDevInfo(!showDevInfo)}
+                className={`flex items-center gap-1.5 text-xs sm:text-sm px-3 py-2 rounded-full border transition-colors ${isStandbyMode ? 'bg-gray-800 border-gray-700 text-gray-300' : 'bg-slate-100 text-slate-600 border-slate-200 hover:bg-slate-200'}`}
+                title="Developer Settings"
+            >
+              <Info className="w-4 h-4" />
+            </button>
+
+            {permission !== 'granted' && (
                 <button
                     onClick={() => enablePushNotifications(false)}
                     className="flex items-center gap-2 text-xs sm:text-sm text-indigo-600 bg-indigo-50 px-3 py-2 rounded-full hover:bg-indigo-100 transition-colors border border-indigo-200"
@@ -333,40 +430,85 @@ const App: React.FC = () => {
                   <Radio className="w-4 h-4" />
                   <span className="hidden sm:inline">Enable Push</span>
                 </button>
-            ) : (
-                <div className="text-xs text-green-600 font-medium bg-green-50 px-2 py-1 rounded-md border border-green-100 flex items-center gap-1">
-                  <Bell className="w-3 h-3" /> On
-                </div>
             )}
           </div>
         </header>
 
+        {showDevInfo && (
+            <div className="w-full max-w-3xl mb-4 p-4 bg-slate-100 rounded-xl border border-slate-200 animate-in slide-in-from-top-2">
+              <h3 className="font-bold text-slate-700 text-sm mb-2 flex items-center gap-2">
+                <Github className="w-4 h-4"/> 1. GitHub Action Setup (One-time)
+              </h3>
+              <ol className="text-xs text-slate-600 mb-4 list-decimal pl-5 space-y-1">
+                <li>Go to your GitHub Repository</li>
+                <li>Go to <b>Settings</b> &rarr; <b>Secrets and variables</b> &rarr; <b>Actions</b></li>
+                <li>Click <b>New repository secret</b></li>
+                <li>Name: <code className="bg-slate-200 px-1 rounded">VERCEL_PROJECT_URL</code></li>
+                <li>Value: Your app URL (copy button below)</li>
+              </ol>
+
+              <div className="flex gap-2 mb-4">
+                <button
+                    onClick={handleCopyHost}
+                    className="flex items-center gap-1.5 text-xs sm:text-sm px-3 py-2 rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 transition-colors"
+                >
+                  <Copy className="w-3.5 h-3.5" />
+                  Copy App URL
+                </button>
+              </div>
+
+              <h3 className="font-bold text-slate-700 text-sm mb-2 flex items-center gap-2">
+                <RotateCw className="w-3 h-3"/> 2. Test Connection
+              </h3>
+              <div className="flex gap-2">
+                <button
+                    onClick={handleTriggerDigest}
+                    disabled={isCheckingDigest}
+                    className="flex items-center gap-1.5 text-xs sm:text-sm px-3 py-2 rounded-lg bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 transition-colors"
+                >
+                  <RotateCw className={`w-3.5 h-3.5 ${isCheckingDigest ? 'animate-spin' : ''}`} />
+                  Test Server Scan
+                </button>
+              </div>
+            </div>
+        )}
+
         <main className="w-full max-w-3xl space-y-6">
-          <div className="flex p-1 bg-white rounded-xl shadow-sm border border-slate-100">
+          <div className={`flex p-1 rounded-xl shadow-sm border transition-colors ${isStandbyMode ? 'bg-gray-900 border-gray-800' : 'bg-white border-slate-100'}`}>
             <button
                 onClick={() => setActiveTab('upcoming')}
-                className={`flex-1 py-2 text-sm font-medium rounded-lg transition-all ${activeTab === 'upcoming' ? 'bg-indigo-50 text-indigo-700 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
+                className={`flex-1 py-2 text-sm font-medium rounded-lg transition-all ${
+                    activeTab === 'upcoming'
+                        ? 'bg-indigo-600 text-white shadow-sm'
+                        : (isStandbyMode ? 'text-gray-400 hover:text-gray-200' : 'text-slate-500 hover:text-slate-700')
+                }`}
             >
-              Upcoming
+              Upcoming (7 Days)
             </button>
             <button
                 onClick={() => setActiveTab('all')}
-                className={`flex-1 py-2 text-sm font-medium rounded-lg transition-all ${activeTab === 'all' ? 'bg-indigo-50 text-indigo-700 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
+                className={`flex-1 py-2 text-sm font-medium rounded-lg transition-all ${
+                    activeTab === 'all'
+                        ? 'bg-indigo-600 text-white shadow-sm'
+                        : (isStandbyMode ? 'text-gray-400 hover:text-gray-200' : 'text-slate-500 hover:text-slate-700')
+                }`}
             >
               All Events
             </button>
           </div>
 
           {isLoading ? (
-              <div className="flex flex-col items-center justify-center py-20 text-slate-400">
+              <div className="flex flex-col items-center justify-center py-20 opacity-50">
                 <Loader2 className="w-8 h-8 animate-spin mb-3 text-indigo-500" />
                 <p>Syncing events...</p>
               </div>
           ) : displayedEvents.length === 0 ? (
-              <div className="flex flex-col items-center justify-center py-16 text-slate-400 bg-white rounded-2xl border border-dashed border-slate-200">
-                <CalendarIcon className="w-12 h-12 mb-3 text-slate-200" />
-                <p className="text-lg font-medium text-slate-600">No events found</p>
-                <p className="text-sm">Tap the + button to create one</p>
+              <div className={`flex flex-col items-center justify-center py-16 rounded-2xl border border-dashed transition-colors ${isStandbyMode ? 'bg-gray-900 border-gray-700 text-gray-500' : 'bg-white border-slate-200 text-slate-400'}`}>
+                <CalendarIcon className="w-12 h-12 mb-3 opacity-50" />
+                <p className="text-lg font-medium">
+                  {activeTab === 'upcoming' ? 'No upcoming events this week' : 'No events found'}
+                </p>
+                <p className="text-sm opacity-70">Tap the + button to create one</p>
               </div>
           ) : (
               <div className="grid gap-4 sm:grid-cols-2">
@@ -401,9 +543,9 @@ const App: React.FC = () => {
             initialEvent={editingEvent}
         />
 
-        {showMobileTip && (
+        {showMobileTip && !isStandbyMode && (
             <div className="fixed bottom-24 left-4 right-4 bg-slate-900 text-white text-xs p-3 rounded-lg shadow-lg flex justify-between items-center z-30 sm:hidden opacity-90">
-              <span>Tip: Add to Home Screen for the best experience.</span>
+              <span>Tip: Use Standby Mode to ensure alarms ring at night.</span>
               <button onClick={() => setShowMobileTip(false)} className="p-1"><X className="w-4 h-4"/></button>
             </div>
         )}

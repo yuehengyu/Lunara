@@ -25,102 +25,106 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     try {
-        // STRICT "Tomorrow Calendar Day" Logic (Toronto Time)
-        const nowToronto = DateTime.now().setZone('America/Toronto');
-        const targetStart = nowToronto.plus({ days: 1 }).startOf('day');
-        const targetEnd = nowToronto.plus({ days: 1 }).endOf('day');
-
-        console.log(`Cron: Scanning events. Target Window (Toronto): ${targetStart.toFormat('yyyy-MM-dd HH:mm')} - ${targetEnd.toFormat('HH:mm')}`);
-
-        // We only need next_alert_at now.
-        const { data: events } = await supabase
-            .from('events')
-            .select('*');
-
+        const { data: events } = await supabase.from('events').select('*');
         if (!events || events.length === 0) {
             return res.status(200).json({ message: 'Database is empty.' });
         }
 
-        const notificationsSent = [];
         const deviceAlerts: Record<string, string[]> = {};
+        const notificationsSent = new Set<string>();
         const eventsToDelete: string[] = [];
 
-        // 3. Process Events
-        for (const event of events) {
-            // CLEANUP LOGIC:
-            const nowUtc = DateTime.now().toUTC();
-            // Use next_alert_at strictly
-            const nextAlertUtc = DateTime.fromISO(event.next_alert_at).toUTC();
-            const isOneTime = !event.recurrence_rule || event.recurrence_rule.type === 'none' || !event.recurrence_rule.type;
+        // --- TIME WINDOWS ---
+        // 1. Tomorrow Digest Window (Toronto Time)
+        const nowToronto = DateTime.now().setZone('America/Toronto');
+        const tomorrowStart = nowToronto.plus({ days: 1 }).startOf('day');
+        const tomorrowEnd = nowToronto.plus({ days: 1 }).endOf('day');
 
-            // Delete if passed > 2 hours ago (server side safety net, client deletes at 1 min)
+        // 2. Instant Alert Window (Universal UTC)
+        // Check for alerts due in the next 15 minutes (or recently passed within 2 mins to catch delayed crons)
+        const nowUtc = DateTime.now().toUTC();
+        const upcomingLimit = nowUtc.plus({ minutes: 15 });
+        const pastTolerance = nowUtc.minus({ minutes: 2 });
+
+        console.log(`Scanning... Now(UTC): ${nowUtc.toFormat('HH:mm')}, UpcomingLimit: ${upcomingLimit.toFormat('HH:mm')}`);
+
+        for (const event of events) {
+            if (!event.device_id) continue;
+
+            // CLEANUP Check (2 hours old)
+            const nextAlertUtc = DateTime.fromISO(event.next_alert_at).toUTC();
+            const isOneTime = !event.recurrence_rule || event.recurrence_rule.type === 'none';
             if (isOneTime && nextAlertUtc < nowUtc.minus({ hours: 2 })) {
                 eventsToDelete.push(event.id);
                 continue;
             }
 
-            // NOTIFICATION LOGIC:
-            if (!event.device_id) continue;
-
-            // Base time for calculation. Strictly use next_alert_at
-            const alertBaseTime = DateTime.fromISO(event.next_alert_at).setZone('America/Toronto');
-
+            // Base Alert Time (UTC for calculation, Zone for display)
+            const alertBaseIso = DateTime.fromISO(event.next_alert_at); // keeps offset
             const reminders = event.reminders || [0];
 
             for (const minutesBefore of reminders) {
-                // When should the alarm ring?
-                const alertTime = alertBaseTime.minus({ minutes: minutesBefore });
+                // Calculate the specific alarm moment
+                const alertMoment = alertBaseIso.minus({ minutes: minutesBefore }).toUTC();
 
-                // Does this alarm ring "Tomorrow"?
-                if (alertTime >= targetStart && alertTime <= targetEnd) {
-
+                // --- LOGIC A: Instant Push (Server Wake Up) ---
+                // If the event is happening NOW (or next 15 mins), send a push immediately.
+                // This solves the "Locked Phone" issue if this API is hit frequently.
+                if (alertMoment >= pastTolerance && alertMoment <= upcomingLimit) {
                     if (!deviceAlerts[event.device_id]) deviceAlerts[event.device_id] = [];
 
-                    let label = "";
-                    const displayTime = alertBaseTime; // Show the Event Time in the notification
+                    // Format for user friendly time
+                    const displayTime = alertMoment.setZone(event.timezone || 'America/Toronto');
+                    const label = `🔔 NOW: ${event.title} (${displayTime.toFormat('HH:mm')})`;
 
-                    if (minutesBefore === 0) {
-                        label = `• ${displayTime.toFormat('HH:mm')} - ${event.title}`;
-                    } else if (minutesBefore === 1440) {
-                        label = `• Reminder: ${event.title} is coming up on ${displayTime.toFormat('MMM dd')}`;
-                    } else if (minutesBefore > 1440) {
-                        const days = Math.round(minutesBefore / 1440);
-                        label = `• In ${days} days: ${event.title}`;
-                    } else {
-                        label = `• Reminder: ${event.title} (${displayTime.toFormat('HH:mm')})`;
-                    }
-
-                    // Deduplicate
+                    // Add to send list
                     if (!deviceAlerts[event.device_id].includes(label)) {
                         deviceAlerts[event.device_id].push(label);
+                    }
+                }
+
+                // --- LOGIC B: Daily Digest (Tomorrow) ---
+                // Only run this check if we are near the "Daily Digest" time (e.g. 11pm Toronto)
+                // Or just run it always, deduplication handles spam.
+                // Actually, to prevent spamming the "Tomorrow" digest every 10 minutes,
+                // we should restrict this to the daily cron schedule (23:00).
+                // For now, let's allow it but label it clearly.
+                const alertMomentToronto = alertMoment.setZone('America/Toronto');
+                if (alertMomentToronto >= tomorrowStart && alertMomentToronto <= tomorrowEnd) {
+                    // Only include digest if this script is running around 11PM Toronto time (approx 4AM UTC)
+                    // This prevents the digest from sending every 10 mins if user sets up high freq cron
+                    if (nowToronto.hour === 23) {
+                        if (!deviceAlerts[event.device_id]) deviceAlerts[event.device_id] = [];
+                        const label = `📅 Tomorrow: ${event.title} at ${alertMomentToronto.toFormat('HH:mm')}`;
+                        if (!deviceAlerts[event.device_id].includes(label)) {
+                            deviceAlerts[event.device_id].push(label);
+                        }
                     }
                 }
             }
         }
 
+        // Cleanup
         if (eventsToDelete.length > 0) {
-            const { error: delError } = await supabase.from('events').delete().in('id', eventsToDelete);
-            if(delError) console.error("Deletion failed:", delError);
+            await supabase.from('events').delete().in('id', eventsToDelete);
         }
 
+        // Send Pushes
         for (const [deviceId, alerts] of Object.entries(deviceAlerts)) {
             if (!alerts || alerts.length === 0) continue;
 
-            const { data: subs } = await supabase
-                .from('subscriptions')
-                .select('*')
-                .eq('device_id', deviceId);
-
+            const { data: subs } = await supabase.from('subscriptions').select('*').eq('device_id', deviceId);
             if (!subs || subs.length === 0) continue;
 
-            const title = `📅 Daily Digest: ${alerts.length} Alert${alerts.length > 1 ? 's' : ''} for Tomorrow`;
-            const body = alerts.slice(0, 4).join('\n') + (alerts.length > 4 ? `\n...and ${alerts.length - 4} more` : '');
+            // Group alerts
+            const title = alerts.some(a => a.includes('NOW')) ? '🚨 Event Reminder' : '📅 Daily Digest';
+            const body = alerts.join('\n');
 
             for (const subRecord of subs) {
                 try {
                     const payload = JSON.stringify({ title, body, url: '/' });
                     await webpush.sendNotification(subRecord.subscription, payload);
-                    notificationsSent.push(deviceId);
+                    notificationsSent.add(deviceId);
                 } catch (err: any) {
                     console.error(`Failed to push to device ${deviceId}`, err);
                     if (err.statusCode === 410 || err.statusCode === 404 || err.statusCode === 403) {
@@ -132,8 +136,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
         res.status(200).json({
             success: true,
-            eventsDeleted: eventsToDelete.length,
-            devicesNotified: notificationsSent.length
+            scanned: events.length,
+            notificationsSent: notificationsSent.size
         });
     } catch (error: any) {
         console.error('Cron failed:', error);
