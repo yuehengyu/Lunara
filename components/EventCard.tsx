@@ -2,8 +2,7 @@
 import React from 'react';
 import { AppEvent } from '../types';
 import { getNextOccurrence } from '../services/timeService';
-import { downloadIcs } from '../services/calendar';
-import { RotateCw, Moon, Trash2, Edit2, CalendarPlus } from 'lucide-react';
+import { RotateCw, Moon, Trash2, Edit2 } from 'lucide-react';
 
 interface EventCardProps {
   event: AppEvent;
@@ -51,14 +50,6 @@ export const EventCard: React.FC<EventCardProps> = ({ event, onEdit, onDelete })
           </div>
 
           <div className="flex gap-1 shrink-0">
-            <button
-                onClick={() => downloadIcs(event)}
-                className="text-slate-300 hover:text-green-600 hover:bg-green-50 transition-colors p-1.5 rounded-md"
-                title="Add to Phone Calendar"
-                aria-label="Add to Phone Calendar"
-            >
-              <CalendarPlus className="w-4 h-4" />
-            </button>
             <button
                 onClick={() => onEdit(event)}
                 className="text-slate-300 hover:text-indigo-600 hover:bg-indigo-50 transition-colors p-1.5 rounded-md"

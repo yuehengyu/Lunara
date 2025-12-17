@@ -29,7 +29,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     try {
-        // STRICT "Tomorrow Calendar Day" Logic (Toronto Time) - same as Cron
+        // 1. Determine "Tomorrow" in Toronto Time
+        // We look ahead to find alerts that fall into the standard "Tomorrow" window for the user
+        // This assumes the user base is primarily in Toronto context for the daily digest.
         const nowToronto = DateTime.now().setZone('America/Toronto');
         const targetStart = nowToronto.plus({ days: 1 }).startOf('day');
         const targetEnd = nowToronto.plus({ days: 1 }).endOf('day');
@@ -52,35 +54,37 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         let matchedAlertCount = 0;
 
         for (const event of events) {
-            // Cleanup Logic (UTC)
-            const eventTimeUtc = DateTime.fromISO(event.start_at).toUTC();
+            // 2. Strict Cleanup Logic (Using UTC to be safe)
+            // Check if next_alert_at is more than 2 hours in the past
+            const nextAlertUtc = DateTime.fromISO(event.next_alert_at).toUTC();
             const nowUtc = DateTime.now().toUTC();
-            const isOneTime = !event.recurrence_rule || event.recurrence_rule.type === 'none' || !event.recurrence_rule.type;
+            const isOneTime = !event.recurrence_rule || event.recurrence_rule.type === 'none';
 
-            if (isOneTime && eventTimeUtc < nowUtc.minus({ hours: 2 })) {
+            if (isOneTime && nextAlertUtc < nowUtc.minus({ hours: 2 })) {
                 eventsToDelete.push(event.id);
                 continue;
             }
 
-            // Notification Logic
+            // 3. Notification Logic
             if (!event.device_id) continue;
 
-            const alertBaseTime = event.next_alert_at
-                ? DateTime.fromISO(event.next_alert_at).setZone('America/Toronto')
-                : DateTime.fromISO(event.start_at).setZone('America/Toronto');
+            // CRITICAL: Convert the stored event time (which might be +08:00) to Toronto time (-05:00)
+            // This ensures we check if the moment of the alert falls on "Tomorrow Toronto Day"
+            const alertBaseTime = DateTime.fromISO(event.next_alert_at).setZone('America/Toronto');
 
             const reminders = event.reminders || [0];
 
             for (const minutesBefore of reminders) {
                 const alertTime = alertBaseTime.minus({ minutes: minutesBefore });
 
-                // Strict Window Match
+                // Check if the ALERT TIME falls within "Tomorrow" in Toronto
                 if (alertTime >= targetStart && alertTime <= targetEnd) {
 
                     matchedAlertCount++;
                     if (!deviceAlerts[event.device_id]) deviceAlerts[event.device_id] = [];
 
                     let label = "";
+                    // Display the time in Toronto format so the user knows when it rings locally
                     const displayTime = alertBaseTime;
 
                     if (minutesBefore === 0) {
@@ -100,6 +104,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             }
         }
 
+        // Batch delete expired events
         if (eventsToDelete.length > 0) {
             await supabase.from('events').delete().in('id', eventsToDelete);
         }
@@ -109,10 +114,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
                 success: true,
                 eventsFound: events.length,
                 eventsDeleted: eventsToDelete.length,
+                matchedAlerts: matchedAlertCount,
                 message: `No alerts found for tomorrow (${targetStart.toFormat('yyyy-MM-dd')}).`
             });
         }
 
+        // Send Pushes
         for (const [deviceId, alerts] of Object.entries(deviceAlerts)) {
             if (!alerts || alerts.length === 0) continue;
 

@@ -1,7 +1,7 @@
 
 import React, { useEffect } from 'react';
 import { AppEvent } from '../types';
-import { X, Bell, Calendar, Clock } from 'lucide-react';
+import { Bell, Calendar, Clock } from 'lucide-react';
 import { getNextOccurrence } from '../services/timeService';
 
 interface AlarmPopupProps {
