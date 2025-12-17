@@ -29,14 +29,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     try {
-        // 1. Target Day (Tomorrow Toronto)
+        // STRICT "Tomorrow Calendar Day" Logic (Toronto Time) - same as Cron
         const nowToronto = DateTime.now().setZone('America/Toronto');
-        const targetDayStart = nowToronto.plus({ days: 1 }).startOf('day');
-        const targetDayEnd = nowToronto.plus({ days: 1 }).endOf('day');
+        const targetStart = nowToronto.plus({ days: 1 }).startOf('day');
+        const targetEnd = nowToronto.plus({ days: 1 }).endOf('day');
 
-        console.log(`Manual Trigger: Checking ALL events for alerts on ${targetDayStart.toFormat('yyyy-MM-dd')}`);
+        console.log(`Manual Trigger: Scanning events for window (Toronto): ${targetStart.toFormat('yyyy-MM-dd HH:mm')} - ${targetEnd.toFormat('HH:mm')}`);
 
-        // 2. Fetch ALL events (No date filter)
         const { data: events, error: eventError } = await supabase
             .from('events')
             .select('*');
@@ -53,39 +52,46 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         let matchedAlertCount = 0;
 
         for (const event of events) {
-            const eventTime = DateTime.fromISO(event.next_alert_at).setZone('America/Toronto');
-            const isOneTime = !event.recurrence_rule || event.recurrence_rule.type === 'none';
+            // Cleanup Logic (UTC)
+            const eventTimeUtc = DateTime.fromISO(event.start_at).toUTC();
+            const nowUtc = DateTime.now().toUTC();
+            const isOneTime = !event.recurrence_rule || event.recurrence_rule.type === 'none' || !event.recurrence_rule.type;
 
-            // CLEANUP: If one-time and past (allow 12h buffer just in case)
-            if (isOneTime && eventTime < nowToronto.minus({ hours: 12 })) {
+            if (isOneTime && eventTimeUtc < nowUtc.minus({ hours: 2 })) {
                 eventsToDelete.push(event.id);
                 continue;
             }
 
+            // Notification Logic
             if (!event.device_id) continue;
+
+            const alertBaseTime = event.next_alert_at
+                ? DateTime.fromISO(event.next_alert_at).setZone('America/Toronto')
+                : DateTime.fromISO(event.start_at).setZone('America/Toronto');
 
             const reminders = event.reminders || [0];
 
             for (const minutesBefore of reminders) {
-                const alertTime = eventTime.minus({ minutes: minutesBefore });
+                const alertTime = alertBaseTime.minus({ minutes: minutesBefore });
 
-                // Match Target Day
-                if (alertTime >= targetDayStart && alertTime <= targetDayEnd) {
+                // Strict Window Match
+                if (alertTime >= targetStart && alertTime <= targetEnd) {
 
                     matchedAlertCount++;
                     if (!deviceAlerts[event.device_id]) deviceAlerts[event.device_id] = [];
 
                     let label = "";
+                    const displayTime = alertBaseTime;
 
                     if (minutesBefore === 0) {
-                        label = `• ${alertTime.toFormat('HH:mm')} - ${event.title}`;
+                        label = `• ${displayTime.toFormat('HH:mm')} - ${event.title}`;
                     } else if (minutesBefore === 1440) {
-                        label = `• ${event.title} is tomorrow!`;
+                        label = `• Reminder: ${event.title} is coming up on ${displayTime.toFormat('MMM dd')}`;
                     } else if (minutesBefore > 1440) {
                         const days = Math.round(minutesBefore / 1440);
-                        label = `• Heads up: ${event.title} in ${days} days`;
+                        label = `• In ${days} days: ${event.title}`;
                     } else {
-                        label = `• Reminder: ${event.title} (${eventTime.toFormat('HH:mm')})`;
+                        label = `• Reminder: ${event.title} (${displayTime.toFormat('HH:mm')})`;
                     }
                     if (!deviceAlerts[event.device_id].includes(label)) {
                         deviceAlerts[event.device_id].push(label);
@@ -94,7 +100,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             }
         }
 
-        // Execute Cleanup
         if (eventsToDelete.length > 0) {
             await supabase.from('events').delete().in('id', eventsToDelete);
         }
@@ -104,7 +109,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
                 success: true,
                 eventsFound: events.length,
                 eventsDeleted: eventsToDelete.length,
-                message: 'Events checked. No alerts fall on target day.'
+                message: `No alerts found for tomorrow (${targetStart.toFormat('yyyy-MM-dd')}).`
             });
         }
 
@@ -114,7 +119,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             const { data: subs } = await supabase.from('subscriptions').select('*').eq('device_id', deviceId);
             if (!subs || subs.length === 0) continue;
 
-            const title = `📅 Daily Digest: ${alerts.length} Alert${alerts.length > 1 ? 's' : ''}`;
+            const title = `📅 Digest: ${alerts.length} Alert${alerts.length > 1 ? 's' : ''} for Tomorrow`;
             const body = alerts.slice(0, 4).join('\n') + (alerts.length > 4 ? `\n...and ${alerts.length - 4} more` : '');
 
             for (const subRecord of subs) {

@@ -77,8 +77,8 @@ export const cleanupPastEvents = async (events: AppEvent[]) => {
     // If it has NO recurrence rule
     if (!e.recurrenceRule || e.recurrenceRule.type === 'none') {
       const eventTime = DateTime.fromISO(e.startAt, { zone: e.timezone });
-      // If event time + 12 hours buffer is still in the past
-      if (eventTime.plus({ hours: 12 }) < now) {
+      // Reduce buffer to 2 hours
+      if (eventTime.plus({ hours: 2 }) < now) {
         toDelete.push(e.id);
       }
     }
@@ -86,7 +86,8 @@ export const cleanupPastEvents = async (events: AppEvent[]) => {
 
   if (toDelete.length > 0) {
     console.log(`Auto-deleting ${toDelete.length} past events...`);
-    await supabase.from('events').delete().in('id', toDelete);
+    const { error } = await supabase.from('events').delete().in('id', toDelete);
+    if (error) console.error("Auto-delete failed:", error);
     return toDelete; // Return IDs so UI can update state locally
   }
   return [];

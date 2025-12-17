@@ -25,16 +25,16 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     try {
-        // 1. Define "Now" and "Tomorrow" (Target Window)
+        // STRICT "Tomorrow Calendar Day" Logic (Toronto Time)
+        // 1. Get current time in Toronto
         const nowToronto = DateTime.now().setZone('America/Toronto');
-        const targetDayStart = nowToronto.plus({ days: 1 }).startOf('day');
-        const targetDayEnd = nowToronto.plus({ days: 1 }).endOf('day');
 
-        console.log(`Cron: Scanning ALL events. Looking for alerts on ${targetDayStart.toFormat('yyyy-MM-dd')}`);
+        // 2. Define "Tomorrow" as the full calendar day (00:00 - 23:59)
+        const targetStart = nowToronto.plus({ days: 1 }).startOf('day');
+        const targetEnd = nowToronto.plus({ days: 1 }).endOf('day');
 
-        // 2. Fetch ALL events.
-        // We do this to ensure we catch "1 month before" reminders for events 1 month away, etc.
-        // Also allows us to clean up old one-time events.
+        console.log(`Cron: Scanning events. Target Window (Toronto): ${targetStart.toFormat('yyyy-MM-dd HH:mm')} - ${targetEnd.toFormat('HH:mm')}`);
+
         const { data: events } = await supabase
             .from('events')
             .select('*');
@@ -49,44 +49,54 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
         // 3. Process Events
         for (const event of events) {
-            const eventTime = DateTime.fromISO(event.next_alert_at).setZone('America/Toronto');
-            const isOneTime = !event.recurrence_rule || event.recurrence_rule.type === 'none';
+            // CLEANUP LOGIC:
+            // Check deletion based on actual time passed (UTC comparison is safest for "past")
+            const eventTimeUtc = DateTime.fromISO(event.start_at).toUTC();
+            const nowUtc = DateTime.now().toUTC();
+            const isOneTime = !event.recurrence_rule || event.recurrence_rule.type === 'none' || !event.recurrence_rule.type;
 
-            // --- CLEANUP LOGIC ---
-            // If it's a one-time event and the time is completely in the past (before today), delete it.
-            // We use 'nowToronto' to be safe.
-            if (isOneTime && eventTime < nowToronto.minus({ hours: 12 })) {
-                console.log(`Marking expired event for deletion: ${event.title}`);
+            // Delete if passed > 2 hours ago
+            if (isOneTime && eventTimeUtc < nowUtc.minus({ hours: 2 })) {
                 eventsToDelete.push(event.id);
-                continue; // Skip notification check for dead events
+                continue;
             }
 
-            // --- NOTIFICATION LOGIC ---
+            // NOTIFICATION LOGIC:
             if (!event.device_id) continue;
+
+            // Base time for calculation. Prefer next_alert_at, fallback to start_at
+            // We convert this base time to Toronto timezone to perform arithmetic correctly relative to user expectations if needed,
+            // but Luxon handles subtraction correctly regardless of zone.
+            // Crucially, we map the RESULT (alertTime) to Toronto to compare with targetStart/End.
+            const alertBaseTime = event.next_alert_at
+                ? DateTime.fromISO(event.next_alert_at).setZone('America/Toronto')
+                : DateTime.fromISO(event.start_at).setZone('America/Toronto');
 
             const reminders = event.reminders || [0];
 
             for (const minutesBefore of reminders) {
-                // Calculate the exact moment the user should be notified
-                const alertTime = eventTime.minus({ minutes: minutesBefore });
+                // When should the alarm ring?
+                const alertTime = alertBaseTime.minus({ minutes: minutesBefore });
 
-                // Check if that moment falls within "Tomorrow" (00:00 - 23:59)
-                if (alertTime >= targetDayStart && alertTime <= targetDayEnd) {
+                // Does this alarm ring "Tomorrow"?
+                if (alertTime >= targetStart && alertTime <= targetEnd) {
 
                     if (!deviceAlerts[event.device_id]) deviceAlerts[event.device_id] = [];
 
                     let label = "";
+                    const displayTime = alertBaseTime; // Show the Event Time in the notification
 
                     if (minutesBefore === 0) {
-                        label = `• ${alertTime.toFormat('HH:mm')} - ${event.title}`;
+                        label = `• ${displayTime.toFormat('HH:mm')} - ${event.title}`;
                     } else if (minutesBefore === 1440) {
-                        // Exactly 24h before
-                        label = `• ${event.title} is tomorrow! (at ${eventTime.toFormat('HH:mm')})`;
+                        // Reminder is "1 Day Before", meaning the EVENT is the day AFTER tomorrow
+                        // But the ALERT is Tomorrow.
+                        label = `• Reminder: ${event.title} is coming up on ${displayTime.toFormat('MMM dd')}`;
                     } else if (minutesBefore > 1440) {
                         const days = Math.round(minutesBefore / 1440);
-                        label = `• Heads up: ${event.title} in ${days} days`;
+                        label = `• In ${days} days: ${event.title}`;
                     } else {
-                        label = `• Reminder: ${event.title} (at ${eventTime.toFormat('HH:mm')})`;
+                        label = `• Reminder: ${event.title} (${displayTime.toFormat('HH:mm')})`;
                     }
 
                     // Deduplicate
@@ -97,13 +107,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             }
         }
 
-        // 4. Batch Delete Expired Events
         if (eventsToDelete.length > 0) {
-            await supabase.from('events').delete().in('id', eventsToDelete);
-            console.log(`Cleaned up ${eventsToDelete.length} expired events.`);
+            const { error: delError } = await supabase.from('events').delete().in('id', eventsToDelete);
+            if(delError) console.error("Deletion failed:", delError);
         }
 
-        // 5. Send Notifications
         for (const [deviceId, alerts] of Object.entries(deviceAlerts)) {
             if (!alerts || alerts.length === 0) continue;
 
@@ -114,7 +122,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
             if (!subs || subs.length === 0) continue;
 
-            const title = `📅 Daily Digest: ${alerts.length} Alert${alerts.length > 1 ? 's' : ''}`;
+            const title = `📅 Daily Digest: ${alerts.length} Alert${alerts.length > 1 ? 's' : ''} for Tomorrow`;
             const body = alerts.slice(0, 4).join('\n') + (alerts.length > 4 ? `\n...and ${alerts.length - 4} more` : '');
 
             for (const subRecord of subs) {
