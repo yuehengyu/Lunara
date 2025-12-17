@@ -4,52 +4,32 @@ import { createClient } from '@supabase/supabase-js';
 import webpush from 'web-push';
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
-    // Allow GET or POST for manual triggering
     if (req.method !== 'POST' && req.method !== 'GET') {
         return res.status(405).json({ error: 'Method not allowed' });
     }
 
-    // 1. Extract Config inside handler to avoid top-level crashes
     const SUPABASE_URL = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
     const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_KEY || process.env.VITE_SUPABASE_ANON_KEY;
 
-    const VAPID_PUBLIC_KEY = process.env.VITE_VAPID_PUBLIC_KEY || process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY;
-    const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY;
-    const VAPID_EMAIL = process.env.VITE_VAPID_EMAIL || 'mailto:yuehengyuzs1211@gmail.com';
+    const VAPID_EMAIL = 'mailto:yuehengyuzs1211@gmail.com';
+    const VAPID_PUBLIC_KEY = 'BDS748jbOSm0hDpwy9IHva9edOidWJHtD-Z9WT2KmKW0bsu0YcHD1dKYjJIg_WkIn1ZtvlLnTaNz_b-zWGZoH0E';
+    const VAPID_PRIVATE_KEY = 'iBsEE9A6-Yz5oioLYXFXhL-TlDbCiUUlJ3l-4iJWdSw';
 
-    // 2. Validate Config
     if (!SUPABASE_URL || !SUPABASE_KEY) {
-        console.error("Missing Supabase Config. Url:", !!SUPABASE_URL, "Key:", !!SUPABASE_KEY);
-        return res.status(500).json({
-            error: 'Server Configuration Error',
-            details: 'Missing Supabase URL or Key. If you just added them, please Redeploy your project in Vercel for changes to take effect.'
-        });
+        return res.status(500).json({ error: 'Server Configuration Error' });
     }
 
-    if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) {
-        console.error("Missing VAPID Config");
-        return res.status(500).json({ error: 'Server Configuration Error', details: 'Missing VAPID Keys.' });
-    }
-
-    // 3. Initialize Services
     const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
     try {
-        webpush.setVapidDetails(
-            VAPID_EMAIL,
-            VAPID_PUBLIC_KEY,
-            VAPID_PRIVATE_KEY
-        );
-    } catch (err) {
-        console.error("VAPID Setup Error", err);
+        webpush.setVapidDetails(VAPID_EMAIL, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
+    } catch (err: any) {
+        return res.status(500).json({ error: "VAPID Setup Error", details: err.message });
     }
 
     try {
         const now = new Date();
-        // Check events for the next 24 hours
         const tomorrow = new Date(now.getTime() + 24 * 60 * 60 * 1000);
-
-        console.log(`Checking events between ${now.toISOString()} and ${tomorrow.toISOString()}`);
 
         const { data: events, error: eventError } = await supabase
             .from('events')
@@ -60,22 +40,18 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         if (eventError) throw eventError;
 
         if (!events || events.length === 0) {
-            return res.status(200).json({ success: true, eventsFound: 0, message: 'No upcoming events found in the next 24 hours.' });
+            return res.status(200).json({ success: true, eventsFound: 0, message: 'No upcoming events.' });
         }
 
         const notificationsSent = [];
         const deviceEvents: Record<string, any[]> = {};
 
-        // Group by device
         for (const event of events) {
             if (!event.device_id) continue;
-            if (!deviceEvents[event.device_id]) {
-                deviceEvents[event.device_id] = [];
-            }
+            if (!deviceEvents[event.device_id]) deviceEvents[event.device_id] = [];
             deviceEvents[event.device_id].push(event);
         }
 
-        // Process each device
         for (const [deviceId, userEvents] of Object.entries(deviceEvents)) {
             if (!userEvents || userEvents.length === 0) continue;
 
@@ -84,20 +60,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
                 .select('*')
                 .eq('device_id', deviceId);
 
-            if (subError || !subs || subs.length === 0) {
-                console.log(`No subscription found for device ${deviceId}`);
-                continue;
-            }
+            if (subError || !subs || subs.length === 0) continue;
 
             const eventCount = userEvents.length;
             const title = `📅 Upcoming: ${eventCount} Event${eventCount > 1 ? 's' : ''}`;
-
             const bodyLines = userEvents
                 .slice(0, 3)
                 .map((e: any) => `• ${e.title} at ${new Date(e.next_alert_at).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}`);
-
             if (userEvents.length > 3) bodyLines.push(`...and ${userEvents.length - 3} more.`);
-
             const body = bodyLines.join('\n');
 
             for (const subRecord of subs) {
@@ -107,7 +77,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
                     notificationsSent.push(deviceId);
                 } catch (err: any) {
                     console.error(`Failed to push to device ${deviceId}`, err);
-                    if (err.statusCode === 410 || err.statusCode === 404) {
+                    // Delete subscription if invalid (4xx) to allow client to heal later
+                    if (err.statusCode === 410 || err.statusCode === 404 || err.statusCode === 403) {
                         await supabase.from('subscriptions').delete().eq('id', subRecord.id);
                     }
                 }
@@ -117,11 +88,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         res.status(200).json({
             success: true,
             eventsFound: events.length,
-            devicesNotified: notificationsSent.length,
-            message: `Sent notifications to ${notificationsSent.length} devices.`
+            devicesNotified: notificationsSent.length
         });
     } catch (error: any) {
-        console.error('Trigger failed:', error);
         res.status(500).json({ error: error.message });
     }
 }

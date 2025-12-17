@@ -20,6 +20,17 @@ function urlBase64ToUint8Array(base64String: string) {
   return outputArray;
 }
 
+function arrayBufferToBase64(buffer: ArrayBuffer) {
+  let binary = '';
+  const bytes = new Uint8Array(buffer);
+  const len = bytes.byteLength;
+  for (let i = 0; i < len; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  // Convert standard Base64 to URL-Safe Base64 to match VAPID convention
+  return window.btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
 // HARDCODED PUBLIC KEY (Must match the Private Key in Backend)
 const VAPID_PUBLIC_KEY = 'BDS748jbOSm0hDpwy9IHva9edOidWJHtD-Z9WT2KmKW0bsu0YcHD1dKYjJIg_WkIn1ZtvlLnTaNz_b-zWGZoH0E';
 
@@ -67,6 +78,33 @@ const App: React.FC = () => {
     }
   }, [deviceId]);
 
+  // AUTO-FIX: On mount, check if current subscription matches hardcoded key. If not, re-subscribe.
+  useEffect(() => {
+    const validateAndFixSubscription = async () => {
+      if (permission === 'granted' && 'serviceWorker' in navigator && deviceId) {
+        try {
+          const registration = await navigator.serviceWorker.ready;
+          const sub = await registration.pushManager.getSubscription();
+          if (sub && sub.options.applicationServerKey) {
+            const currentKey = arrayBufferToBase64(sub.options.applicationServerKey);
+            // Check if key starts with the same characters (simple check)
+            // Note: browser might return standard base64 vs url-safe, so we check loosely or just re-sub if backend fails.
+            // But let's try a direct comparison if possible.
+            if (currentKey !== VAPID_PUBLIC_KEY) {
+              console.log("Key mismatch detected. Current:", currentKey, "Expected:", VAPID_PUBLIC_KEY);
+              // Silent upgrade
+              await enablePushNotifications(true);
+            }
+          }
+        } catch (e) {
+          console.error("Auto-fix check failed", e);
+        }
+      }
+    };
+    // Small delay to ensure browser ready
+    setTimeout(validateAndFixSubscription, 1000);
+  }, [permission, deviceId]);
+
   // Request Notification & Subscribe to Push
   const enablePushNotifications = async (forceReset = false) => {
     if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
@@ -84,11 +122,13 @@ const App: React.FC = () => {
 
         // If forcing reset (e.g. keys changed), unsubscribe first
         if (forceReset && subscription) {
+          console.log("Unsubscribing old subscription...");
           await subscription.unsubscribe();
           subscription = null;
         }
 
         if (!subscription) {
+          console.log("Creating new subscription with current key...");
           subscription = await registration.pushManager.subscribe({
             userVisibleOnly: true,
             applicationServerKey: urlBase64ToUint8Array(VAPID_PUBLIC_KEY)
@@ -99,9 +139,7 @@ const App: React.FC = () => {
         await saveSubscription(deviceId, subscription);
 
         if (forceReset) {
-          alert("Push notifications re-configured successfully!");
-        } else {
-          // alert("Push notifications enabled!"); // Reduced noise
+          console.log("Push reset complete.");
         }
       }
     } catch (error) {
@@ -117,16 +155,13 @@ const App: React.FC = () => {
     }
     setIsTestingPush(true);
     try {
-      // FORCE SYNC: Before testing, ensure server has the latest subscription
-      // This fixes the "No subscription found" error if the DB was cleared or sync failed.
+      // Force sync first
       if ('serviceWorker' in navigator) {
         const registration = await navigator.serviceWorker.ready;
         const subscription = await registration.pushManager.getSubscription();
         if (subscription) {
-          console.log("Force syncing subscription before test...");
           await saveSubscription(deviceId, subscription);
         } else {
-          // If permission granted but no subscription object, try to re-subscribe
           await enablePushNotifications(false);
         }
       }
@@ -146,6 +181,15 @@ const App: React.FC = () => {
       const data = await res.json();
 
       if (!res.ok) {
+        // AUTO-HEALING
+        // If 403 (BadJwtToken) or 404 (Deleted), we must reset the client.
+        if (res.status === 403 || res.status === 404 || (data.error && data.error.includes("expired"))) {
+          console.warn("Detected invalid subscription (403/404). Auto-healing...");
+          await enablePushNotifications(true); // Force Unsubscribe -> Subscribe
+          alert("Your push configuration was outdated and has been reset. Please click Test again!");
+          setIsTestingPush(false);
+          return;
+        }
         throw new Error(data.error || `Server Error ${res.status}`);
       }
 
