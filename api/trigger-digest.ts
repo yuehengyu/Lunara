@@ -3,25 +3,45 @@ import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { createClient } from '@supabase/supabase-js';
 import webpush from 'web-push';
 
-// Config
-const SUPABASE_URL = process.env.SUPABASE_URL!;
-const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
-const VAPID_PUBLIC_KEY = process.env.VITE_VAPID_PUBLIC_KEY!;
-const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY!;
-const VAPID_EMAIL = process.env.VITE_VAPID_EMAIL || 'mailto:example@example.com';
-
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
-
-webpush.setVapidDetails(
-    VAPID_EMAIL,
-    VAPID_PUBLIC_KEY,
-    VAPID_PRIVATE_KEY
-);
-
 export default async function handler(req: VercelRequest, res: VercelResponse) {
     // Allow GET or POST for manual triggering
     if (req.method !== 'POST' && req.method !== 'GET') {
         return res.status(405).json({ error: 'Method not allowed' });
+    }
+
+    // 1. Extract Config inside handler to avoid top-level crashes
+    const SUPABASE_URL = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
+    const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_KEY || process.env.VITE_SUPABASE_ANON_KEY;
+
+    const VAPID_PUBLIC_KEY = process.env.VITE_VAPID_PUBLIC_KEY || process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY;
+    const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY;
+    const VAPID_EMAIL = process.env.VITE_VAPID_EMAIL || 'mailto:yuehengyuzs1211@gmail.com';
+
+    // 2. Validate Config
+    if (!SUPABASE_URL || !SUPABASE_KEY) {
+        console.error("Missing Supabase Config. Url:", !!SUPABASE_URL, "Key:", !!SUPABASE_KEY);
+        return res.status(500).json({
+            error: 'Server Configuration Error',
+            details: 'Missing Supabase URL or Key. If you just added them, please Redeploy your project in Vercel for changes to take effect.'
+        });
+    }
+
+    if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) {
+        console.error("Missing VAPID Config");
+        return res.status(500).json({ error: 'Server Configuration Error', details: 'Missing VAPID Keys.' });
+    }
+
+    // 3. Initialize Services
+    const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+
+    try {
+        webpush.setVapidDetails(
+            VAPID_EMAIL,
+            VAPID_PUBLIC_KEY,
+            VAPID_PRIVATE_KEY
+        );
+    } catch (err) {
+        console.error("VAPID Setup Error", err);
     }
 
     try {
@@ -29,7 +49,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         // Check events for the next 24 hours
         const tomorrow = new Date(now.getTime() + 24 * 60 * 60 * 1000);
 
-        // Log for debugging in Vercel functions logs
         console.log(`Checking events between ${now.toISOString()} and ${tomorrow.toISOString()}`);
 
         const { data: events, error: eventError } = await supabase
@@ -41,12 +60,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         if (eventError) throw eventError;
 
         if (!events || events.length === 0) {
-            return res.status(200).json({ message: 'No upcoming events found in the next 24 hours.' });
+            return res.status(200).json({ success: true, eventsFound: 0, message: 'No upcoming events found in the next 24 hours.' });
         }
 
         const notificationsSent = [];
         const deviceEvents: Record<string, any[]> = {};
 
+        // Group by device
         for (const event of events) {
             if (!event.device_id) continue;
             if (!deviceEvents[event.device_id]) {
@@ -59,7 +79,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         for (const [deviceId, userEvents] of Object.entries(deviceEvents)) {
             if (!userEvents || userEvents.length === 0) continue;
 
-            // Fetch subscription for this device
             const { data: subs, error: subError } = await supabase
                 .from('subscriptions')
                 .select('*')
@@ -70,7 +89,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
                 continue;
             }
 
-            // Construct the message
             const eventCount = userEvents.length;
             const title = `📅 Upcoming: ${eventCount} Event${eventCount > 1 ? 's' : ''}`;
 
@@ -82,15 +100,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
             const body = bodyLines.join('\n');
 
-            // Send to all subscriptions for this device
             for (const subRecord of subs) {
                 try {
-                    const payload = JSON.stringify({
-                        title,
-                        body,
-                        url: '/'
-                    });
-
+                    const payload = JSON.stringify({ title, body, url: '/' });
                     await webpush.sendNotification(subRecord.subscription, payload);
                     notificationsSent.push(deviceId);
                 } catch (err: any) {

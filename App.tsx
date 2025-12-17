@@ -111,14 +111,28 @@ const App: React.FC = () => {
         body: JSON.stringify({ deviceId }),
         headers: { 'Content-Type': 'application/json' }
       });
+
+      // Check for non-JSON response (e.g., 404 HTML from Vite or 500 HTML from Vercel)
+      const contentType = res.headers.get("content-type");
+      if (!contentType || !contentType.includes("application/json")) {
+        const text = await res.text();
+        throw new Error(`Server returned non-JSON response (${res.status}). Are you running locally? API endpoints only work on Vercel deployment. Response snippet: ${text.slice(0, 100)}`);
+      }
+
       const data = await res.json();
+
+      if (!res.ok) {
+        throw new Error(data.error || `Server Error ${res.status}`);
+      }
+
       if (data.success) {
         alert("Test notification sent! Check your notification center.");
       } else {
         alert("Failed to send test: " + (data.error || 'Unknown error'));
       }
-    } catch (e) {
-      alert("Error sending test request");
+    } catch (e: any) {
+      console.error(e);
+      alert(`Error: ${e.message}`);
     } finally {
       setIsTestingPush(false);
     }
@@ -134,7 +148,20 @@ const App: React.FC = () => {
       const res = await fetch('/api/trigger-digest', {
         method: 'POST',
       });
+
+      // Check for non-JSON response
+      const contentType = res.headers.get("content-type");
+      if (!contentType || !contentType.includes("application/json")) {
+        const text = await res.text();
+        throw new Error(`Server returned non-JSON response (${res.status}). If running 'npm run dev', APIs won't work. Deploy to Vercel to test. Response: ${text.slice(0, 100)}...`);
+      }
+
       const data = await res.json();
+
+      if (!res.ok) {
+        throw new Error(data.error || `Server Error ${res.status}`);
+      }
+
       if (data.success) {
         if (data.eventsFound > 0) {
           alert(`Success! Found ${data.eventsFound} upcoming events and sent to ${data.devicesNotified} devices.`);
@@ -144,8 +171,9 @@ const App: React.FC = () => {
       } else {
         alert("Check completed: " + (data.message || data.error));
       }
-    } catch (e) {
-      alert("Error triggering check.");
+    } catch (e: any) {
+      console.error(e);
+      alert(`Error Triggering Check: ${e.message}`);
     } finally {
       setIsCheckingDigest(false);
     }
