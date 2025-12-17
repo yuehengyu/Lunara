@@ -1,3 +1,4 @@
+
 import { createClient } from '@supabase/supabase-js';
 import { AppEvent } from '../types';
 
@@ -15,13 +16,14 @@ const mapFromDb = (row: any): AppEvent => ({
   id: row.id,
   title: row.title,
   description: row.description,
-  // location removed
   startAt: row.start_at,
   endAt: row.end_at,
   isAllDay: row.is_all_day,
   timezone: row.timezone || 'America/Toronto',
   recurrenceRule: row.recurrence_rule,
   reminders: row.reminders || [],
+  nextAlertAt: row.next_alert_at,
+  deviceId: row.device_id,
   createdAt: row.created_at,
   updatedAt: row.updated_at,
 });
@@ -31,22 +33,29 @@ const mapToDb = (event: AppEvent) => ({
   id: event.id,
   title: event.title,
   description: event.description,
-  // location removed
   start_at: event.startAt,
   end_at: event.endAt,
   is_all_day: event.isAllDay,
   timezone: event.timezone,
   recurrence_rule: event.recurrenceRule,
   reminders: event.reminders,
+  next_alert_at: event.nextAlertAt, // Critical for Cron Job
+  device_id: event.deviceId,       // Critical for targeting
 });
 
-export const fetchEvents = async (): Promise<AppEvent[]> => {
+export const fetchEvents = async (deviceId?: string): Promise<AppEvent[]> => {
   if (!supabase) return [];
 
-  const { data, error } = await supabase
+  let query = supabase
       .from('events')
       .select('*')
       .order('created_at', { ascending: false });
+
+  // If we have a deviceId, simpler apps might filter by it, 
+  // but for now we fetch all (shared mode) or you can uncomment below to isolate:
+  // if (deviceId) query = query.eq('device_id', deviceId);
+
+  const { data, error } = await query;
 
   if (error) {
     console.error('Error fetching events:', error);
@@ -87,4 +96,20 @@ export const updateEvent = async (event: AppEvent) => {
       .eq('id', event.id);
 
   if (error) console.error('Error updating event:', error);
+};
+
+// New: Save Push Subscription
+export const saveSubscription = async (deviceId: string, subscription: PushSubscription) => {
+  if (!supabase) return;
+
+  // Basic upsert logic: delete old for this device, insert new
+  // In a real app with Auth, you'd tie this to User ID.
+  await supabase.from('subscriptions').delete().eq('device_id', deviceId);
+
+  const { error } = await supabase.from('subscriptions').insert({
+    device_id: deviceId,
+    subscription: subscription.toJSON()
+  });
+
+  if (error) console.error('Failed to save subscription', error);
 };

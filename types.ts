@@ -1,3 +1,4 @@
+
 export type RecurrenceType = 'none' | 'daily' | 'weekly' | 'monthly' | 'yearly_solar' | 'yearly_lunar' | 'custom';
 
 export interface RecurrenceRule {
@@ -19,20 +20,23 @@ export interface AppEvent {
   id: string;
   title: string;
   description?: string;
-  // location field removed as per user request
 
   // Stored as ISO string with offset (timestamptz in DB)
   startAt: string;
   endAt?: string;
   isAllDay: boolean;
 
-  // IANA Timezone string. UI will restrict to 'Asia/Shanghai' or 'America/Toronto'
+  // IANA Timezone string.
   timezone: string;
 
   recurrenceRule: RecurrenceRule | null;
 
   // Array of minutes before event to notify
   reminders: number[];
+
+  // Backend Push Fields
+  nextAlertAt?: string | null; // The calculated ISO string for the NEXT push
+  deviceId?: string; // Links event to the device that created it
 
   createdAt: string;
   updatedAt: string;

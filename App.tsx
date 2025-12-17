@@ -1,67 +1,131 @@
+
 import React, { useState, useEffect, useCallback } from 'react';
-import { Plus, Bell, Calendar as CalendarIcon, List, Database, Loader2 } from 'lucide-react';
+import { Plus, Bell, Calendar as CalendarIcon, List, Database, Loader2, Info, X, Radio } from 'lucide-react';
 import { AppEvent } from './types';
-import { fetchEvents, createEvent, deleteEvent, updateEvent, isSupabaseConfigured } from './services/storage';
+import { fetchEvents, createEvent, deleteEvent, updateEvent, isSupabaseConfigured, saveSubscription } from './services/storage';
 import { checkNotifications, getNextOccurrence, shouldUpdateRecurringEvent } from './services/timeService';
 import { EventCard } from './components/EventCard';
 import { AddEventModal } from './components/AddEventModal';
+import { AlarmPopup } from './components/AlarmPopup';
+
+// Helper for VAPID key conversion
+function urlBase64ToUint8Array(base64String: string) {
+  const padding = '='.repeat((4 - base64String.length % 4) % 4);
+  const base64 = (base64String + padding).replace(/\-/g, '+').replace(/_/g, '/');
+  const rawData = window.atob(base64);
+  const outputArray = new Uint8Array(rawData.length);
+  for (let i = 0; i < rawData.length; ++i) {
+    outputArray[i] = rawData.charCodeAt(i);
+  }
+  return outputArray;
+}
 
 const App: React.FC = () => {
   const [events, setEvents] = useState<AppEvent[]>([]);
   const [isModalOpen, setIsModalOpen] = useState(false);
-  const [editingEvent, setEditingEvent] = useState<AppEvent | null>(null); // For Edit Mode
+  const [editingEvent, setEditingEvent] = useState<AppEvent | null>(null);
   const [activeTab, setActiveTab] = useState<'upcoming' | 'all'>('upcoming');
   const [permission, setPermission] = useState<NotificationPermission>('default');
   const [isLoading, setIsLoading] = useState(true);
+  const [showMobileTip, setShowMobileTip] = useState(true);
+  const [deviceId, setDeviceId] = useState<string>('');
 
+  const [triggerEvent, setTriggerEvent] = useState<AppEvent | null>(null);
   const [notifiedLog, setNotifiedLog] = useState<Set<string>>(new Set());
+
+  // Initialize Device ID
+  useEffect(() => {
+    let storedId = localStorage.getItem('luna_device_id');
+    if (!storedId) {
+      storedId = crypto.randomUUID();
+      localStorage.setItem('luna_device_id', storedId);
+    }
+    setDeviceId(storedId);
+  }, []);
 
   useEffect(() => {
     const load = async () => {
       setIsLoading(true);
-      const data = await fetchEvents();
+      const data = await fetchEvents(deviceId); // Pass deviceId if you want to filter
       setEvents(data);
       setIsLoading(false);
     };
 
-    load();
+    if (isSupabaseConfigured) {
+      load();
+    } else {
+      setIsLoading(false);
+    }
 
     if ('Notification' in window) {
       setPermission(Notification.permission);
     }
-  }, []);
+  }, [deviceId]);
 
-  const requestPermission = useCallback(async () => {
-    if (!('Notification' in window)) {
-      alert("This browser does not support desktop notifications");
+  // Request Notification & Subscribe to Push
+  const enablePushNotifications = async () => {
+    if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
+      alert("Push notifications are not supported on this browser.");
       return;
     }
-    const result = await Notification.requestPermission();
-    setPermission(result);
-  }, []);
 
+    try {
+      const permission = await Notification.requestPermission();
+      setPermission(permission);
+
+      if (permission === 'granted') {
+        const registration = await navigator.serviceWorker.ready;
+        const vapidKey = process.env.VITE_VAPID_PUBLIC_KEY;
+
+        if (!vapidKey) {
+          console.warn("Missing VITE_VAPID_PUBLIC_KEY env var");
+          return;
+        }
+
+        const subscription = await registration.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: urlBase64ToUint8Array(vapidKey)
+        });
+
+        // Save to Supabase
+        await saveSubscription(deviceId, subscription);
+        alert("Push notifications enabled! You will now receive alerts even if the app is closed.");
+      }
+    } catch (error) {
+      console.error("Push subscription failed", error);
+      alert("Failed to enable push notifications. Check console for details.");
+    }
+  };
+
+  // Local Polling for foreground alerts
   useEffect(() => {
     const intervalId = setInterval(async () => {
-      // 1. Check Notifications
+      // 1. Check Foreground Notifications
       checkNotifications(events, (event, text) => {
         const key = `${event.id}-${new Date().getMinutes()}`;
         if (!notifiedLog.has(key)) {
-          if (permission === 'granted') {
-            new Notification(`Reminder: ${event.title}`, {
-              body: `${text} - ${event.description || ''}`,
-              icon: '/icon.png'
-            });
-          }
+          // In-App Popup
+          setTriggerEvent(event);
           setNotifiedLog(prev => new Set(prev).add(key));
         }
       });
 
-      // 2. Auto-Reschedule
+      // 2. Auto-update recurring events (Logic moved to save, but keeping this for safety)
       let needsRefresh = false;
       const updatedEvents = await Promise.all(events.map(async (event) => {
         const newStartAt = shouldUpdateRecurringEvent(event);
         if (newStartAt) {
-          const updatedEvent = { ...event, startAt: newStartAt, updatedAt: new Date().toISOString() };
+          // Recalculate next alert for backend too
+          const tempEvent = { ...event, startAt: newStartAt };
+          const nextOcc = getNextOccurrence(tempEvent);
+
+          const updatedEvent: AppEvent = {
+            ...event,
+            startAt: newStartAt,
+            nextAlertAt: nextOcc.isoString,
+            updatedAt: new Date().toISOString()
+          };
+
           await updateEvent(updatedEvent);
           needsRefresh = true;
           return updatedEvent;
@@ -72,22 +136,30 @@ const App: React.FC = () => {
       if (needsRefresh) {
         setEvents(updatedEvents);
       }
-
-    }, 10000);
+    }, 5000);
 
     return () => clearInterval(intervalId);
   }, [events, permission, notifiedLog]);
 
   const handleSaveEvent = async (event: AppEvent) => {
+    // CRITICAL: Calculate the Next Alert Timestamp BEFORE saving to DB
+    // This allows the simple Backend Cron Job to just check "is nextAlertAt < now?"
+    // without needing complex lunar libraries on the server.
+    const nextOcc = getNextOccurrence(event);
+
+    const eventWithMeta: AppEvent = {
+      ...event,
+      deviceId, // Link to this device
+      nextAlertAt: nextOcc.isoString // Pre-calculate for backend
+    };
+
     if (editingEvent) {
-      // Update existing
-      setEvents(prev => prev.map(e => e.id === event.id ? event : e));
-      await updateEvent(event);
+      setEvents(prev => prev.map(e => e.id === event.id ? eventWithMeta : e));
+      await updateEvent(eventWithMeta);
       setEditingEvent(null);
     } else {
-      // Create new
-      setEvents(prev => [...prev, event]);
-      await createEvent(event);
+      setEvents(prev => [...prev, eventWithMeta]);
+      await createEvent(eventWithMeta);
     }
     setIsModalOpen(false);
   };
@@ -104,11 +176,6 @@ const App: React.FC = () => {
     }
   };
 
-  const handleCloseModal = () => {
-    setIsModalOpen(false);
-    setEditingEvent(null);
-  };
-
   // Sort logic
   const displayedEvents = [...events].sort((a, b) => {
     if (activeTab === 'all') {
@@ -120,24 +187,30 @@ const App: React.FC = () => {
   });
 
   return (
-      <div className="min-h-screen bg-slate-50 flex flex-col items-center py-4 px-4 sm:py-8 pb-24 sm:pb-8">
+      <div className="min-h-screen bg-slate-50 flex flex-col items-center py-4 px-4 sm:py-8 pb-24 sm:pb-8 font-sans">
+        <AlarmPopup
+            event={triggerEvent}
+            onClose={() => setTriggerEvent(null)}
+            onSnooze={() => setTriggerEvent(null)}
+        />
+
         <header className="w-full max-w-3xl mb-6 flex justify-between items-center sticky top-0 bg-slate-50 z-10 py-2">
           <div>
             <h1 className="text-2xl sm:text-3xl font-bold text-slate-900 tracking-tight flex items-center gap-2">
               <span className="bg-indigo-600 text-white p-1.5 rounded-lg text-lg sm:text-xl shadow-sm">LR</span>
               LunaRemind
             </h1>
-            <p className="text-xs sm:text-sm text-slate-500 mt-1">Global events, Lunar aware.</p>
+            <p className="text-xs sm:text-sm text-slate-500 mt-1">Cloud Push Enabled</p>
           </div>
 
           <div className="flex items-center gap-2 sm:gap-3">
             {permission !== 'granted' && (
                 <button
-                    onClick={requestPermission}
-                    className="flex items-center gap-2 text-xs sm:text-sm text-amber-600 bg-amber-50 px-3 py-2 rounded-full hover:bg-amber-100 transition-colors"
+                    onClick={enablePushNotifications}
+                    className="flex items-center gap-2 text-xs sm:text-sm text-indigo-600 bg-indigo-50 px-3 py-2 rounded-full hover:bg-indigo-100 transition-colors border border-indigo-200"
                 >
-                  <Bell className="w-4 h-4" />
-                  <span className="hidden sm:inline">Enable Alerts</span>
+                  <Radio className="w-4 h-4" />
+                  <span className="hidden sm:inline">Enable Push</span>
                 </button>
             )}
 
@@ -157,12 +230,30 @@ const App: React.FC = () => {
                 <Database className="w-5 h-5 shrink-0 mt-0.5" />
                 <div>
                   <p className="font-semibold">Database Connection Missing</p>
-                  <p className="mt-1">Please connect to Supabase (Free) to save your events permanently.</p>
-                  <p className="mt-2 text-xs opacity-75">Add VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY to your Vercel Environment Variables.</p>
+                  <p className="mt-1">Backend push requires Supabase connection.</p>
                 </div>
               </div>
           )}
 
+          {showMobileTip && (
+              <div className="mb-4 bg-blue-50 border border-blue-100 rounded-lg p-3 sm:p-4 flex gap-3 text-blue-800 relative">
+                <Info className="w-5 h-5 shrink-0 mt-0.5 text-blue-600" />
+                <div className="pr-4">
+                  <p className="text-sm font-semibold">Real Push Notifications</p>
+                  <p className="text-xs sm:text-sm mt-1 text-blue-700/80">
+                    Click "Enable Push" to receive notifications even when the app is closed. This uses Vercel Cron Jobs to check your events every minute.
+                  </p>
+                </div>
+                <button
+                    onClick={() => setShowMobileTip(false)}
+                    className="absolute top-2 right-2 text-blue-400 hover:text-blue-600 p-1"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+          )}
+
+          {/* Existing List UI ... */}
           <div className="flex gap-6 mb-4 sm:mb-6 border-b border-slate-200 sticky top-16 bg-slate-50 z-10 pt-2">
             <button
                 onClick={() => setActiveTab('upcoming')}
@@ -191,12 +282,11 @@ const App: React.FC = () => {
                   <Bell className="w-8 h-8" />
                 </div>
                 <h3 className="text-lg font-medium text-slate-900">No events yet</h3>
-                <p className="text-slate-500 mt-1 max-w-xs mx-auto px-4">Create your first event manually.</p>
                 <button
                     onClick={() => { setEditingEvent(null); setIsModalOpen(true); }}
                     className="mt-4 text-indigo-600 font-medium hover:text-indigo-700 bg-indigo-50 px-4 py-2 rounded-lg transition-colors"
                 >
-                  Create Event
+                  New Event
                 </button>
               </div>
           ) : (
@@ -223,7 +313,7 @@ const App: React.FC = () => {
 
         <AddEventModal
             isOpen={isModalOpen}
-            onClose={handleCloseModal}
+            onClose={() => { setIsModalOpen(false); setEditingEvent(null); }}
             onSave={handleSaveEvent}
             initialEvent={editingEvent}
         />
